@@ -33,8 +33,10 @@ try {
   const envContent = readFileSync(CHANNELS_ENV, "utf8");
   for (const line of envContent.split("\n")) {
     const match = line.match(/^(\w+)=(.*)$/);
-    if (match && !process.env[match[1]]) {
-      process.env[match[1]] = match[2];
+    const key = match?.[1];
+    const val = match?.[2];
+    if (key && val !== undefined && !process.env[key]) {
+      process.env[key] = val.trim().replace(/^["']|["']$/g, "");
     }
   }
 } catch {
@@ -54,13 +56,60 @@ if (!MM_BOT_TOKEN) {
   process.exit(1);
 }
 
+// Warn if token will travel in cleartext over a non-localhost connection
+try {
+  const url = new URL(MM_URL);
+  if (url.protocol === "http:" && !["localhost", "127.0.0.1", "[::1]"].includes(url.hostname)) {
+    console.error(
+      `mattermost-channel: WARNING — MM_URL is plain HTTP (${url.hostname}). ` +
+      "Bot token and messages will be sent in cleartext. Use HTTPS for non-localhost servers."
+    );
+  }
+} catch {}
+
+
+// -- Crash handlers — log and keep serving instead of dying silently --
+process.on("unhandledRejection", (err) => {
+  console.error("mattermost-channel: unhandled rejection:", err);
+});
+process.on("uncaughtException", (err) => {
+  console.error("mattermost-channel: uncaught exception:", err);
+});
+
 // -- Access control paths --
 const CHANNELS_DIR = join(homedir(), ".claude", "channels", "mattermost");
 const ACCESS_FILE = join(CHANNELS_DIR, "access.json");
 const APPROVED_DIR = join(CHANNELS_DIR, "approved");
 
-mkdirSync(CHANNELS_DIR, { recursive: true });
-mkdirSync(APPROVED_DIR, { recursive: true });
+mkdirSync(CHANNELS_DIR, { recursive: true, mode: 0o700 });
+mkdirSync(APPROVED_DIR, { recursive: true, mode: 0o700 });
+
+// -- Mattermost API response types (partial, fields we use) --
+type MMChannel = {
+  id: string;
+  type: string;
+  name: string;
+};
+
+type MMUser = {
+  id: string;
+  username: string;
+};
+
+type MMPost = {
+  id: string;
+  channel_id: string;
+  user_id: string;
+  message: string;
+  root_id?: string;
+  create_at: number;
+  file_ids?: string[];
+};
+
+type MMPostList = {
+  order: string[];
+  posts: Record<string, MMPost>;
+};
 
 // -- Access control types --
 type GroupPolicy = {
@@ -91,11 +140,19 @@ const DEFAULT_ACCESS: Access = {
 };
 
 function readAccess(): Access {
+  let raw: string;
   try {
-    const raw = readFileSync(ACCESS_FILE, "utf8");
+    raw = readFileSync(ACCESS_FILE, "utf8");
+  } catch {
+    return { ...DEFAULT_ACCESS }; // file doesn't exist yet
+  }
+  try {
     const parsed = JSON.parse(raw);
     return { ...DEFAULT_ACCESS, ...parsed };
   } catch {
+    // Corrupt JSON — move aside so it's not silently lost
+    try { renameSync(ACCESS_FILE, `${ACCESS_FILE}.corrupt-${Date.now()}`); } catch {}
+    console.error("mattermost-channel: access.json is corrupt, moved aside. Starting fresh.");
     return { ...DEFAULT_ACCESS };
   }
 }
@@ -129,16 +186,45 @@ const MAX_PENDING = 3;
 const MAX_PAIR_REPLIES = 2;
 const PAIR_EXPIRY_MS = 60 * 60 * 1000; // 1 hour
 
+// Bot username for @mention detection in group channels.
+// Resolved once at first use and cached.
+let botUsername: string | null = null;
+async function getBotUsername(): Promise<string | null> {
+  if (botUsername) return botUsername;
+  if (!MM_BOT_USER_ID) return null;
+  try {
+    const user = await mmGetUser(MM_BOT_USER_ID);
+    botUsername = user.username ?? null;
+    return botUsername;
+  } catch {
+    return null;
+  }
+}
+
+// Track recent post IDs sent by the bot — reply-to-bot counts as implicit mention
+const recentSentIds = new Set<string>();
+const RECENT_SENT_CAP = 200;
+
+function noteSent(id: string): void {
+  recentSentIds.add(id);
+  if (recentSentIds.size > RECENT_SENT_CAP) {
+    const first = recentSentIds.values().next().value;
+    if (first) recentSentIds.delete(first);
+  }
+}
+
 async function gate(
   senderId: string,
   channelId: string,
-  isDM: boolean
+  isDM: boolean,
+  messageContent?: string,
+  rootId?: string,
 ): Promise<GateResult> {
   const access = readAccess();
   if (pruneExpired(access)) saveAccess(access);
 
   if (isDM) {
-    if (access.dmPolicy === "disabled") return { action: "drop" };
+    if (access.dmPolicy === "disabled") return { action: "drop" }; // "disabled" = DMs off, all dropped
 
     if (access.allowFrom.includes(senderId)) return { action: "deliver" };
 
@@ -161,7 +247,7 @@ async function gate(
       return { action: "drop" };
     }
 
-    const code = randomBytes(3).toString("hex");
+    const code = randomBytes(4).toString("hex");
     access.pending[code] = {
       senderId,
       chatId: channelId,
@@ -182,22 +268,51 @@ async function gate(
   }
 
   if (policy.requireMention) {
-    // Mention check is done by the caller (needs message content)
-    // We return deliver and let the caller handle mention filtering
-    return { action: "deliver" };
+    const text = messageContent ?? "";
+    let mentioned = false;
+
+    // @username mention
+    const name = await getBotUsername();
+    if (name && text.includes(`@${name}`)) mentioned = true;
+
+    // Reply to one of our recent posts counts as implicit mention
+    if (!mentioned && rootId && recentSentIds.has(rootId)) mentioned = true;
+
+    if (!mentioned) return { action: "drop" };
   }
 
   return { action: "deliver" };
 }
 
-// Check if a channel is allowed for outbound messages
-function isChannelAllowed(channelId: string): boolean {
+// Verify a channel is allowed for outbound messages (reply, edit, react, fetch).
+// Re-checks the allowlist every time — never trusts ephemeral state alone.
+async function verifyOutboundChannel(channelId: string): Promise<void> {
   const access = readAccess();
-  // Allowed if it's a DM channel we've delivered from, or an opted-in group
-  if (access.groups[channelId]) return true;
-  // For DMs, we track allowed channels via the approved senders
-  // The chat_id in pending entries or approved channels are valid targets
-  return true; // DM channels are implicitly allowed if Claude has the chat_id
+
+  // Opted-in group/team channels
+  if (access.groups[channelId]) return;
+
+  const type = await getChannelType(channelId);
+  if (type === "D" || type === "G") {
+    // Try cached sender first (populated on inbound delivery)
+    const cached = dmChannelSenders.get(channelId);
+    if (cached && access.allowFrom.includes(cached)) return;
+
+    // Cache miss or sender was removed — resolve via API for type D
+    if (type === "D") {
+      const ch = await mmGetChannel(channelId);
+      const userIds = (ch.name ?? "").split("__");
+      const other = userIds.find((id: string) => id !== MM_BOT_USER_ID);
+      if (other) {
+        dmChannelSenders.set(channelId, other);
+        if (access.allowFrom.includes(other)) return;
+      }
+    }
+  }
+
+  throw new Error(
+    `channel ${channelId} is not allowlisted — add via /mattermost:access`
+  );
 }
 
 // -- Mattermost REST helpers --
@@ -211,22 +326,22 @@ const mmApi = (path: string, init?: RequestInit) =>
     },
   });
 
-async function mmPost(channelId: string, message: string, rootId?: string) {
+async function mmPost(channelId: string, message: string, rootId?: string): Promise<MMPost> {
   const body: Record<string, string> = { channel_id: channelId, message };
   if (rootId) body.root_id = rootId;
   const res = await mmApi("/posts", {
     method: "POST",
     body: JSON.stringify(body),
   });
-  return res.json();
+  return res.json() as Promise<MMPost>;
 }
 
-async function mmEditPost(postId: string, message: string) {
+async function mmEditPost(postId: string, message: string): Promise<MMPost> {
   const res = await mmApi(`/posts/${postId}/patch`, {
     method: "PUT",
     body: JSON.stringify({ message }),
   });
-  return res.json();
+  return res.json() as Promise<MMPost>;
 }
 
 async function mmReact(postId: string, emoji: string) {
@@ -254,14 +369,14 @@ async function mmSendTyping(channelId: string) {
   });
 }
 
-async function mmGetUser(userId: string) {
+async function mmGetUser(userId: string): Promise<MMUser> {
   const res = await mmApi(`/users/${userId}`);
-  return res.json();
+  return res.json() as Promise<MMUser>;
 }
 
-async function mmGetChannel(channelId: string) {
+async function mmGetChannel(channelId: string): Promise<MMChannel> {
   const res = await mmApi(`/channels/${channelId}`);
-  return res.json();
+  return res.json() as Promise<MMChannel>;
 }
 
 // Cache usernames to avoid repeated lookups
@@ -278,8 +393,8 @@ async function getUsername(userId: string): Promise<string> {
   }
 }
 
-// Track channels we've delivered messages from (for outbound gating)
-const deliveredChannels = new Set<string>();
+// Cache DM channel → sender ID (populated on inbound delivery, used by verifyOutboundChannel)
+const dmChannelSenders = new Map<string, string>();
 
 // Track the last inbound message per channel for reaction-based status
 const pendingMessages = new Map<string, string>();
@@ -385,22 +500,32 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
   ],
 }));
 
+// -- Input validation --
+// Mattermost IDs are 26-char alphanumeric strings.
+const MM_ID_RE = /^[a-z0-9]{26}$/i;
+const EMOJI_RE = /^[a-z0-9_+\-]+$/i;
+
+function validateId(value: unknown, name: string): string {
+  const s = String(value ?? "");
+  if (!MM_ID_RE.test(s)) throw new Error(`invalid ${name}: expected 26-char alphanumeric ID`);
+  return s;
+}
+
+function validateEmoji(value: unknown): string {
+  const s = String(value ?? "");
+  if (!EMOJI_RE.test(s)) throw new Error(`invalid emoji name: ${s}`);
+  return s;
+}
+
 mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
   const args = req.params.arguments as Record<string, any>;
-
+  try {
   switch (req.params.name) {
     case "reply": {
-      const { chat_id, text, reply_to } = args;
-      if (!deliveredChannels.has(chat_id)) {
-        // Also check groups config for channels that were added but haven't
-        // delivered yet (e.g. bot posting first)
-        const access = readAccess();
-        if (!access.groups[chat_id]) {
-          throw new Error(
-            `reply failed: channel ${chat_id} is not allowlisted — add via /mattermost:access`
-          );
-        }
-      }
+      const chat_id = validateId(args.chat_id, "chat_id");
+      const text = String(args.text ?? "");
+      const reply_to = args.reply_to ? validateId(args.reply_to, "reply_to") : undefined;
+      await verifyOutboundChannel(chat_id);
       // Remove 👀 now that we're replying
       const pendingPostId = pendingMessages.get(chat_id);
       if (pendingPostId) {
@@ -410,6 +535,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
 
       const post = await mmPost(chat_id, text, reply_to);
       if (post.id) {
+        noteSent(post.id);
         return {
           content: [{ type: "text" as const, text: `sent (id: ${post.id})` }],
         };
@@ -418,7 +544,8 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
     }
 
     case "edit_message": {
-      const { message_id, text } = args;
+      const message_id = validateId(args.message_id, "message_id");
+      const text = String(args.text ?? "");
       const post = await mmEditPost(message_id, text);
       if (post.id) {
         return { content: [{ type: "text" as const, text: "edited" }] };
@@ -427,32 +554,27 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
     }
 
     case "react": {
-      const { message_id, emoji } = args;
+      const message_id = validateId(args.message_id, "message_id");
+      const emoji = validateEmoji(args.emoji);
       await mmReact(message_id, emoji);
       return { content: [{ type: "text" as const, text: "reacted" }] };
     }
 
     case "fetch_messages": {
-      const { channel, limit = 20 } = args;
-      if (!deliveredChannels.has(channel)) {
-        const access = readAccess();
-        if (!access.groups[channel]) {
-          throw new Error(
-            `fetch_messages failed: channel ${channel} is not allowlisted — add via /mattermost:access`
-          );
-        }
-      }
-      const perPage = Math.min(limit, 200);
+      const channel = validateId(args.channel, "channel");
+      const limit = Math.max(1, Math.min(Number(args.limit) || 20, 200));
+      await verifyOutboundChannel(channel);
+      const perPage = limit;
       const res = await mmApi(
         `/channels/${channel}/posts?per_page=${perPage}`
       );
-      const data = await res.json();
+      const data = (await res.json()) as MMPostList;
       const posts = data.order
-        ?.map((id: string) => data.posts[id])
+        ?.map((id: string) => data.posts[id]!)
         .reverse()
-        .map((p: any) => ({
+        .map((p) => ({
           id: p.id,
-          user: p.username ?? p.user_id,
+          user: p.user_id,
           message: p.message,
           create_at: new Date(p.create_at).toISOString(),
         }));
@@ -464,7 +586,17 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
     }
 
     default:
-      throw new Error(`unknown tool: ${req.params.name}`);
+      return {
+        content: [{ type: "text" as const, text: `unknown tool: ${req.params.name}` }],
+        isError: true,
+      };
+  }
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    return {
+      content: [{ type: "text" as const, text: `${req.params.name} failed: ${msg}` }],
+      isError: true,
+    };
   }
 });
 
@@ -512,11 +644,18 @@ async function getChannelType(channelId: string): Promise<string> {
   }
 }
 
+let currentWs: WebSocket | null = null;
+let reconnectDelay = 5000;
+let shuttingDown = false;
+const MAX_RECONNECT_DELAY = 5 * 60 * 1000; // 5 minutes
+
 function connectWebSocket() {
   const ws = new WebSocket(wsUrl);
+  currentWs = ws;
 
   ws.addEventListener("open", () => {
     console.error("mattermost-channel: WebSocket connected");
+    reconnectDelay = 5000; // reset backoff on successful connection
     ws.send(
       JSON.stringify({
         seq: 1,
@@ -545,7 +684,7 @@ function connectWebSocket() {
       const isDM = channelType === "D" || channelType === "G";
 
       // Gate the message
-      const result = await gate(senderId, channelId, isDM);
+      const result = await gate(senderId, channelId, isDM, post.message, post.root_id);
 
       if (result.action === "drop") {
         return; // silently ignore
@@ -569,7 +708,7 @@ function connectWebSocket() {
       }, 1500);
 
       const username = await getUsername(senderId);
-      deliveredChannels.add(channelId);
+      if (isDM) dmChannelSenders.set(channelId, senderId);
 
       const meta: Record<string, string> = {
         chat_id: channelId,
@@ -600,10 +739,12 @@ function connectWebSocket() {
   });
 
   ws.addEventListener("close", () => {
+    if (shuttingDown) return;
     console.error(
-      "mattermost-channel: WebSocket closed, reconnecting in 5s..."
+      `mattermost-channel: WebSocket closed, reconnecting in ${reconnectDelay / 1000}s...`
     );
-    setTimeout(connectWebSocket, 5000);
+    setTimeout(connectWebSocket, reconnectDelay);
+    reconnectDelay = Math.min(reconnectDelay * 2, MAX_RECONNECT_DELAY);
   });
 
   ws.addEventListener("error", (err) => {
@@ -612,3 +753,17 @@ function connectWebSocket() {
 }
 
 connectWebSocket();
+
+// -- Graceful shutdown --
+function shutdown(): void {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  console.error("mattermost-channel: shutting down");
+  setTimeout(() => process.exit(0), 2000);
+  try { currentWs?.close(); } catch {}
+  process.exit(0);
+}
+process.stdin.on("end", shutdown);
+process.stdin.on("close", shutdown);
+process.on("SIGTERM", shutdown);
+process.on("SIGINT", shutdown);

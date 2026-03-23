@@ -144,8 +144,8 @@ if (!cmd) {
   saveAccess(access);
 
   // Write approval marker for the server to pick up
-  mkdirSync(APPROVED_DIR, { recursive: true });
-  writeFileSync(join(APPROVED_DIR, senderId), chatId);
+  mkdirSync(APPROVED_DIR, { recursive: true, mode: 0o700 });
+  writeFileSync(join(APPROVED_DIR, senderId), chatId, { mode: 0o600 });
 
   console.log(`Approved sender ${senderId}. They'll receive a confirmation in Mattermost.`);
 } else if (cmd === "deny") {

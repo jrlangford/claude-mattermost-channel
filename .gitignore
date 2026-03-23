@@ -5,3 +5,5 @@ channel/bun.lock
 # Auto-generated
 channel/CLAUDE.md
 channel/README.md
+# Local-only files
+local/
