@@ -1,0 +1,7 @@
+# Node
+channel/node_modules/
+channel/bun.lock
+
+# Auto-generated
+channel/CLAUDE.md
+channel/README.md
