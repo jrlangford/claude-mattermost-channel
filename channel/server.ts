@@ -247,7 +247,7 @@ async function gate(
       return { action: "drop" };
     }
 
-    const code = randomBytes(4).toString("hex");
+    const code = randomBytes(8).toString("hex");
     access.pending[code] = {
       senderId,
       chatId: channelId,
@@ -271,9 +271,9 @@ async function gate(
     const text = messageContent ?? "";
     let mentioned = false;
 
-    // @username mention
+    // @username mention (word-boundary check to avoid substring matches)
     const name = await getBotUsername();
-    if (name && text.includes(`@${name}`)) mentioned = true;
+    if (name && new RegExp(`@${name}\\b`).test(text)) mentioned = true;
 
     // Reply to one of our recent posts counts as implicit mention
     if (!mentioned && rootId && recentSentIds.has(rootId)) mentioned = true;
@@ -298,14 +298,23 @@ async function verifyOutboundChannel(channelId: string): Promise<void> {
     const cached = dmChannelSenders.get(channelId);
     if (cached && access.allowFrom.includes(cached)) return;
 
-    // Cache miss or sender was removed — resolve via API for type D
+    // Cache miss or sender was removed — resolve via API
     if (type === "D") {
       const ch = await mmGetChannel(channelId);
       const userIds = (ch.name ?? "").split("__");
       const other = userIds.find((id: string) => id !== MM_BOT_USER_ID);
       if (other) {
-        dmChannelSenders.set(channelId, other);
+        cappedSet(dmChannelSenders, channelId, other, CACHE_CAP);
         if (access.allowFrom.includes(other)) return;
+      }
+    } else if (type === "G") {
+      // Group DM — fetch members and check if any are allowlisted
+      const res = await mmApi(`/channels/${channelId}/members`);
+      const members = (await res.json()) as { user_id: string }[];
+      if (Array.isArray(members)) {
+        for (const m of members) {
+          if (m.user_id !== MM_BOT_USER_ID && access.allowFrom.includes(m.user_id)) return;
+        }
       }
     }
   }
@@ -374,10 +383,26 @@ async function mmGetUser(userId: string): Promise<MMUser> {
   return res.json() as Promise<MMUser>;
 }
 
+async function mmGetPost(postId: string): Promise<MMPost> {
+  const res = await mmApi(`/posts/${postId}`);
+  return res.json() as Promise<MMPost>;
+}
+
 async function mmGetChannel(channelId: string): Promise<MMChannel> {
   const res = await mmApi(`/channels/${channelId}`);
   return res.json() as Promise<MMChannel>;
 }
+
+// Simple capped map — evicts oldest entry when cap is reached
+function cappedSet<K, V>(map: Map<K, V>, key: K, value: V, cap: number): void {
+  map.set(key, value);
+  if (map.size > cap) {
+    const first = map.keys().next().value;
+    if (first !== undefined) map.delete(first);
+  }
+}
+
+const CACHE_CAP = 500;
 
 // Cache usernames to avoid repeated lookups
 const userCache = new Map<string, string>();
@@ -386,7 +411,7 @@ async function getUsername(userId: string): Promise<string> {
   try {
     const user = await mmGetUser(userId);
     const name = user.username ?? userId;
-    userCache.set(userId, name);
+    cappedSet(userCache, userId, name, CACHE_CAP);
     return name;
   } catch {
     return userId;
@@ -546,6 +571,8 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
     case "edit_message": {
       const message_id = validateId(args.message_id, "message_id");
       const text = String(args.text ?? "");
+      const original = await mmGetPost(message_id);
+      await verifyOutboundChannel(original.channel_id);
       const post = await mmEditPost(message_id, text);
       if (post.id) {
         return { content: [{ type: "text" as const, text: "edited" }] };
@@ -556,6 +583,8 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
     case "react": {
       const message_id = validateId(args.message_id, "message_id");
       const emoji = validateEmoji(args.emoji);
+      const reactPost = await mmGetPost(message_id);
+      await verifyOutboundChannel(reactPost.channel_id);
       await mmReact(message_id, emoji);
       return { content: [{ type: "text" as const, text: "reacted" }] };
     }
@@ -637,7 +666,7 @@ async function getChannelType(channelId: string): Promise<string> {
   try {
     const ch = await mmGetChannel(channelId);
     const type = ch.type ?? "O";
-    channelTypeCache.set(channelId, type);
+    cappedSet(channelTypeCache, channelId, type, CACHE_CAP);
     return type;
   } catch {
     return "O";
@@ -708,7 +737,7 @@ function connectWebSocket() {
       }, 1500);
 
       const username = await getUsername(senderId);
-      if (isDM) dmChannelSenders.set(channelId, senderId);
+      if (isDM) cappedSet(dmChannelSenders, channelId, senderId, CACHE_CAP);
 
       const meta: Record<string, string> = {
         chat_id: channelId,

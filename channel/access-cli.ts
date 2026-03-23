@@ -217,10 +217,8 @@ if (!cmd) {
 
     const noMention = args.includes("--no-mention");
     const allowIdx = args.indexOf("--allow");
-    const allowFrom =
-      allowIdx !== -1 && args[allowIdx + 1]
-        ? args[allowIdx + 1].split(",")
-        : [];
+    const allowArg = allowIdx !== -1 ? args[allowIdx + 1] : undefined;
+    const allowFrom = allowArg ? allowArg.split(",") : [];
 
     const access = readAccess();
     access.groups[channelId] = {
