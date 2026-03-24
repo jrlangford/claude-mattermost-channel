@@ -74,6 +74,7 @@ process.on("unhandledRejection", (err) => {
 });
 process.on("uncaughtException", (err) => {
   console.error("mattermost-channel: uncaught exception:", err);
+  process.exit(1);
 });
 
 // -- Access control paths --
@@ -273,7 +274,10 @@ async function gate(
 
     // @username mention (word-boundary check to avoid substring matches)
     const name = await getBotUsername();
-    if (name && new RegExp(`@${name}\\b`).test(text)) mentioned = true;
+    if (name) {
+      const escaped = name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+      if (new RegExp(`@${escaped}\\b`).test(text)) mentioned = true;
+    }
 
     // Reply to one of our recent posts counts as implicit mention
     if (!mentioned && rootId && recentSentIds.has(rootId)) mentioned = true;
@@ -308,13 +312,13 @@ async function verifyOutboundChannel(channelId: string): Promise<void> {
         if (access.allowFrom.includes(other)) return;
       }
     } else if (type === "G") {
-      // Group DM — fetch members and check if any are allowlisted
+      // Group DM — require ALL non-bot members to be allowlisted.
+      // Otherwise a non-allowlisted member could see Claude's responses.
       const res = await mmApi(`/channels/${channelId}/members`);
       const members = (await res.json()) as { user_id: string }[];
       if (Array.isArray(members)) {
-        for (const m of members) {
-          if (m.user_id !== MM_BOT_USER_ID && access.allowFrom.includes(m.user_id)) return;
-        }
+        const others = members.filter((m) => m.user_id !== MM_BOT_USER_ID);
+        if (others.length > 0 && others.every((m) => access.allowFrom.includes(m.user_id))) return;
       }
     }
   }
@@ -542,6 +546,28 @@ function validateEmoji(value: unknown): string {
   return s;
 }
 
+// -- Outbound rate limiting --
+// Sliding window: max outbound actions per channel within the window.
+const RATE_WINDOW_MS = 60_000;
+const RATE_MAX_PER_WINDOW = 15;
+const outboundTimestamps = new Map<string, number[]>();
+
+function checkRate(channelId: string): void {
+  const now = Date.now();
+  const cutoff = now - RATE_WINDOW_MS;
+  let timestamps = outboundTimestamps.get(channelId);
+  if (timestamps) {
+    timestamps = timestamps.filter((t) => t > cutoff);
+  } else {
+    timestamps = [];
+  }
+  if (timestamps.length >= RATE_MAX_PER_WINDOW) {
+    throw new Error(`channel ${channelId} rate limited — too many actions in the last minute`);
+  }
+  timestamps.push(now);
+  cappedSet(outboundTimestamps, channelId, timestamps, CACHE_CAP);
+}
+
 mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
   const args = req.params.arguments as Record<string, any>;
   try {
@@ -551,6 +577,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
       const text = String(args.text ?? "");
       const reply_to = args.reply_to ? validateId(args.reply_to, "reply_to") : undefined;
       await verifyOutboundChannel(chat_id);
+      checkRate(chat_id);
       // Remove 👀 now that we're replying
       const pendingPostId = pendingMessages.get(chat_id);
       if (pendingPostId) {
@@ -572,7 +599,11 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
       const message_id = validateId(args.message_id, "message_id");
       const text = String(args.text ?? "");
       const original = await mmGetPost(message_id);
+      if (original.user_id !== MM_BOT_USER_ID) {
+        throw new Error("can only edit messages sent by this bot");
+      }
       await verifyOutboundChannel(original.channel_id);
+      checkRate(original.channel_id);
       const post = await mmEditPost(message_id, text);
       if (post.id) {
         return { content: [{ type: "text" as const, text: "edited" }] };
@@ -585,6 +616,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
       const emoji = validateEmoji(args.emoji);
       const reactPost = await mmGetPost(message_id);
       await verifyOutboundChannel(reactPost.channel_id);
+      checkRate(reactPost.channel_id);
       await mmReact(message_id, emoji);
       return { content: [{ type: "text" as const, text: "reacted" }] };
     }
@@ -621,9 +653,13 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
       };
   }
   } catch (err) {
-    const msg = err instanceof Error ? err.message : String(err);
+    const detail = err instanceof Error ? err.message : String(err);
+    console.error(`mattermost-channel: ${req.params.name} error:`, detail);
+    // Return a generic message to Claude — avoid leaking server URLs,
+    // network topology, or Mattermost error details into the context.
+    const safe = /^(invalid |can only |channel )/.test(detail) ? detail : "operation failed";
     return {
-      content: [{ type: "text" as const, text: `${req.params.name} failed: ${msg}` }],
+      content: [{ type: "text" as const, text: `${req.params.name} failed: ${safe}` }],
       isError: true,
     };
   }
@@ -637,8 +673,18 @@ function checkApprovals() {
   try {
     const files = readdirSync(APPROVED_DIR);
     for (const senderId of files) {
+      // Validate filename is a real Mattermost ID (defense-in-depth against path traversal)
+      if (!MM_ID_RE.test(senderId)) {
+        console.error(`mattermost-channel: skipping invalid approval file: ${senderId}`);
+        continue;
+      }
       const file = join(APPROVED_DIR, senderId);
       const chatId = readFileSync(file, "utf8").trim();
+      if (!MM_ID_RE.test(chatId)) {
+        console.error(`mattermost-channel: skipping approval with invalid chatId for ${senderId}`);
+        rmSync(file, { force: true });
+        continue;
+      }
       // Send confirmation to the DM channel
       mmPost(chatId, "Paired! You can now send messages to Claude.").catch(
         (err) =>
@@ -704,11 +750,18 @@ function connectWebSocket() {
 
       const post = JSON.parse(msg.data.post);
 
+      // Validate all IDs from the WebSocket at the ingress boundary.
+      // A malicious/compromised Mattermost server could send crafted IDs
+      // that cause path traversal, API path injection, or cache poisoning.
+      if (!post.user_id || !post.channel_id || !post.id) return;
+      if (!MM_ID_RE.test(post.user_id) || !MM_ID_RE.test(post.channel_id) || !MM_ID_RE.test(post.id)) return;
+      if (post.root_id && !MM_ID_RE.test(post.root_id)) return;
+
       // Ignore our own messages
       if (post.user_id === MM_BOT_USER_ID) return;
 
-      const senderId = post.user_id;
-      const channelId = post.channel_id;
+      const senderId: string = post.user_id;
+      const channelId: string = post.channel_id;
       const channelType = await getChannelType(channelId);
       const isDM = channelType === "D" || channelType === "G";
 
@@ -788,9 +841,8 @@ function shutdown(): void {
   if (shuttingDown) return;
   shuttingDown = true;
   console.error("mattermost-channel: shutting down");
-  setTimeout(() => process.exit(0), 2000);
   try { currentWs?.close(); } catch {}
-  process.exit(0);
+  setTimeout(() => process.exit(0), 2000);
 }
 process.stdin.on("end", shutdown);
 process.stdin.on("close", shutdown);

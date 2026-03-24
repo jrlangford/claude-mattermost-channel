@@ -78,6 +78,17 @@ function pruneExpired(access: Access): void {
   }
 }
 
+// Mattermost IDs are 26-char alphanumeric strings.
+const MM_ID_RE = /^[a-z0-9]{26}$/i;
+
+function requireValidId(value: string | undefined, name: string): string {
+  if (!value || !MM_ID_RE.test(value)) {
+    console.error(`Invalid ${name}: expected 26-char alphanumeric Mattermost ID, got "${value ?? ""}"`);
+    process.exit(1);
+  }
+  return value;
+}
+
 const args = process.argv.slice(2);
 const cmd = args[0];
 
@@ -164,11 +175,7 @@ if (!cmd) {
     console.error(`No pending pairing with code "${code}"`);
   }
 } else if (cmd === "allow") {
-  const userId = args[1];
-  if (!userId) {
-    console.error("Usage: allow <userId>");
-    process.exit(1);
-  }
+  const userId = requireValidId(args[1], "userId");
 
   const access = readAccess();
   if (!access.allowFrom.includes(userId)) {
@@ -179,11 +186,7 @@ if (!cmd) {
     console.log(`${userId} is already in allowlist`);
   }
 } else if (cmd === "remove") {
-  const userId = args[1];
-  if (!userId) {
-    console.error("Usage: remove <userId>");
-    process.exit(1);
-  }
+  const userId = requireValidId(args[1], "userId");
 
   const access = readAccess();
   const before = access.allowFrom.length;
@@ -209,16 +212,13 @@ if (!cmd) {
   const subcmd = args[1];
 
   if (subcmd === "add") {
-    const channelId = args[2];
-    if (!channelId) {
-      console.error("Usage: group add <channelId> [--no-mention] [--allow id1,id2]");
-      process.exit(1);
-    }
+    const channelId = requireValidId(args[2], "channelId");
 
     const noMention = args.includes("--no-mention");
     const allowIdx = args.indexOf("--allow");
     const allowArg = allowIdx !== -1 ? args[allowIdx + 1] : undefined;
     const allowFrom = allowArg ? allowArg.split(",") : [];
+    for (const id of allowFrom) requireValidId(id, "allowFrom userId");
 
     const access = readAccess();
     access.groups[channelId] = {
@@ -230,11 +230,7 @@ if (!cmd) {
       `Added channel ${channelId} (mention: ${!noMention}, allowFrom: ${allowFrom.length > 0 ? allowFrom.join(", ") : "all"})`
     );
   } else if (subcmd === "rm") {
-    const channelId = args[2];
-    if (!channelId) {
-      console.error("Usage: group rm <channelId>");
-      process.exit(1);
-    }
+    const channelId = requireValidId(args[2], "channelId");
 
     const access = readAccess();
     if (access.groups[channelId]) {
