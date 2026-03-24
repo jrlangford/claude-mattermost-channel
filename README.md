@@ -47,7 +47,7 @@ This saves credentials to `~/.claude/channels/mattermost/.env` with `600` permis
 ### 4. Launch
 
 ```bash
-claude --channel mattermost
+claude --dangerously-load-development-channels plugin:mattermost@jrlangford-marketplace
 ```
 
 DM your bot on Mattermost — the message arrives in Claude's session and Claude replies back.
