@@ -30,7 +30,8 @@ Bot account creation and user access tokens must be enabled by a server admin:
 ### 2. Install the plugin
 
 ```bash
-claude plugin add /path/to/mattermost-channel/channel
+/plugin marketplace add jrlangford/jrlangford-marketplace
+/plugin install mattermost@jrlangford-marketplace
 ```
 
 ### 3. Configure
