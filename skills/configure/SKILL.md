@@ -1,6 +1,6 @@
 ---
 name: configure
-description: Set up the Mattermost channel — save the bot token, server URL, and review access policy. Use when the user pastes a Mattermost bot token, asks to configure Mattermost, asks "how do I set this up" or "who can reach me," or wants to check channel status.
+description: Set up the Mattermost channel — save bot tokens, server URLs, manage multiple bots, and review access policy. Use when the user pastes a Mattermost bot token, asks to configure Mattermost, asks "how do I set this up" or "who can reach me," or wants to check channel status.
 user-invocable: true
 allowed-tools:
   - Read
@@ -12,10 +12,35 @@ allowed-tools:
 
 # /mattermost:configure — Mattermost Channel Setup
 
-Writes the bot token and server URL to `~/.claude/channels/mattermost/.env`
-and orients the user on access policy. The server reads the env file at boot.
+Manages bot configuration for the Mattermost channel plugin. Supports
+multiple bots via `~/.claude/channels/mattermost/bots.json`.
 
 Arguments passed: `$ARGUMENTS`
+
+---
+
+## Config format
+
+**`bots.json`** (preferred, supports multiple bots):
+```json
+[
+  {
+    "name": "amelia",
+    "url": "https://mattermost.example.com",
+    "token": "abc123...",
+    "userId": "def456..."
+  }
+]
+```
+
+**`.env`** (legacy single-bot, still supported as fallback if `bots.json` absent):
+```
+MM_URL=https://mattermost.example.com
+MM_BOT_TOKEN=abc123...
+MM_BOT_USER_ID=def456...
+```
+
+When `bots.json` exists, the server uses it and ignores `.env`.
 
 ---
 
@@ -23,11 +48,12 @@ Arguments passed: `$ARGUMENTS`
 
 ### No args — status and guidance
 
-Read both state files and give the user a complete picture:
+Read both config files and give the user a complete picture:
 
-1. **Token** — check `~/.claude/channels/mattermost/.env` for
-   `MM_BOT_TOKEN`. Show set/not-set; if set, show first 6 chars masked.
-   Also check `MM_URL` and `MM_BOT_USER_ID`.
+1. **Bots** — check `~/.claude/channels/mattermost/bots.json` first. If it
+   exists, list each bot: name, URL (masked token — first 6 chars + `...`),
+   userId. If no `bots.json`, check `.env` for the legacy single-bot config.
+   Show the effective bot count.
 
 2. **Access** — read `~/.claude/channels/mattermost/access.json` (missing file
    = defaults: `dmPolicy: "pairing"`, empty allowlist). Show:
@@ -37,48 +63,72 @@ Read both state files and give the user a complete picture:
    - Group channels opted in: count and channel IDs
 
 3. **What next** — end with a concrete next step based on state:
-   - No token → *"Run `/mattermost:configure <token>` with your bot's
-     personal access token from Mattermost > Integrations > Bot Accounts."*
-   - Token set, policy is pairing, nobody allowed → *"DM your bot on
+   - No bots → *"Run `/mattermost:configure add <name> <url> <token> <userId>`
+     to add your first bot."*
+   - Bots set, policy is pairing, nobody allowed → *"DM your bot on
      Mattermost. It replies with a code; approve with `/mattermost:access pair
      <code>`."*
-   - Token set, someone allowed → *"Ready. DM your bot to reach the
+   - Bots set, someone allowed → *"Ready. DM your bot to reach the
      assistant."*
 
 **Push toward lockdown — always.** Once all intended users are paired,
 recommend switching to `allowlist` policy via `/mattermost:access policy allowlist`.
 
-### `<token>` — save it
+### `add <name> <url> <token> <userId>` — add a bot
+
+1. `mkdir -p ~/.claude/channels/mattermost`
+2. Read existing `bots.json` if present (default to `[]`).
+3. Check for duplicate name — if found, update in place.
+4. Append `{ name, url, token, userId }` to the array.
+5. Write back as pretty JSON. `chmod 600 bots.json`.
+6. Confirm, then show status.
+7. Remind: *"Restart the session or run `/reload-plugins` to pick up the new bot."*
+
+### `remove <name>` — remove a bot
+
+1. Read `bots.json`. Filter out the entry with matching name.
+2. If array is now empty, delete the file.
+3. Otherwise write back. `chmod 600 bots.json`.
+4. Confirm.
+5. Remind about restart.
+
+### `<token>` — legacy single-arg (save to bots.json as "default")
 
 If a single argument is passed that looks like a Mattermost personal access
 token (26-char alphanumeric string):
 
 1. `mkdir -p ~/.claude/channels/mattermost`
-2. Read existing `.env` if present; update/add the `MM_BOT_TOKEN=` line,
-   preserve other keys. Write back, no quotes around the value.
-3. `chmod 600 ~/.claude/channels/mattermost/.env`
-4. Confirm, then show the no-args status.
-5. Remind: *"You also need `MM_URL` and `MM_BOT_USER_ID` in the .env file.
-   Set MM_URL to your Mattermost server URL (e.g. http://localhost:8065)
-   and MM_BOT_USER_ID to the bot's user ID."*
+2. Read existing `bots.json` if present. Find entry named "default" and update
+   its token, or create `[{ name: "default", url: "http://localhost:8065", token, userId: "" }]`.
+3. Write `bots.json`. `chmod 600`.
+4. Confirm, then show status.
+5. Remind: *"You also need `url` and `userId`. Run
+   `/mattermost:configure add default <url> <token> <userId>` with all fields,
+   or edit `~/.claude/channels/mattermost/bots.json` directly."*
 
-### `<url> <token> <bot_user_id>` — save all three
+### `<url> <token> <userId>` — legacy three-arg (save as "default")
 
 If three arguments are passed:
 
 1. `mkdir -p ~/.claude/channels/mattermost`
-2. Write `.env` with all three values:
-   ```
-   MM_URL=<url>
-   MM_BOT_TOKEN=<token>
-   MM_BOT_USER_ID=<bot_user_id>
-   ```
-3. `chmod 600 ~/.claude/channels/mattermost/.env`
-4. Confirm, then show the no-args status.
+2. Read existing `bots.json`. Find entry named "default" and update, or create
+   `[{ name: "default", url, token, userId }]`.
+3. Write `bots.json`. `chmod 600`.
+4. Confirm, then show status.
 
-### `clear` — remove credentials
+### `clear` — remove all credentials
 
-Delete `~/.claude/channels/mattermost/.env`.
+Delete both `~/.claude/channels/mattermost/bots.json` and `.env` if they exist.
+
+---
+
+## Migration note
+
+If `.env` exists but `bots.json` does not, the server still works (single-bot
+fallback). Offer to migrate: *"You have a legacy .env config. Want me to
+migrate it to bots.json? This enables multi-bot support."* If yes, read `.env`,
+create `bots.json` with a single "default" entry, and rename `.env` to
+`.env.bak`.
 
 ---
 
@@ -86,7 +136,9 @@ Delete `~/.claude/channels/mattermost/.env`.
 
 - The channels dir might not exist if the server hasn't run yet. Missing file
   = not configured, not an error.
-- The server reads `.env` once at boot. Token changes need a session restart
-  or `/reload-plugins`. Say so after saving.
+- The server reads `bots.json` (or `.env`) once at boot. Config changes need a
+  session restart or `/reload-plugins`. Say so after saving.
 - `access.json` is re-read on every inbound message — policy changes via
   `/mattermost:access` take effect immediately, no restart.
+- Bot names must be unique within `bots.json`.
+- Set file permissions to `0o600` for `bots.json` (contains tokens).
