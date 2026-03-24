@@ -128,7 +128,22 @@ function loadBots(): BotConfig[] {
   return [{ name: "default", url, token, userId }];
 }
 
-const botConfigs = loadBots();
+let botConfigs = loadBots();
+
+// Filter by MM_BOT_NAME if set — allows running a subset of bots per session
+const MM_BOT_NAME = process.env.MM_BOT_NAME;
+if (MM_BOT_NAME) {
+  const names = MM_BOT_NAME.split(",").map((n) => n.trim()).filter(Boolean);
+  const filtered = botConfigs.filter((b) => names.includes(b.name));
+  if (filtered.length === 0) {
+    console.error(
+      `mattermost-channel: MM_BOT_NAME="${MM_BOT_NAME}" matches no bots in config. ` +
+      `Available: ${botConfigs.map((b) => b.name).join(", ")}`
+    );
+    process.exit(1);
+  }
+  botConfigs = filtered;
+}
 
 // Validate configs
 for (const bot of botConfigs) {
