@@ -1,6 +1,10 @@
 # Mattermost Channel for Claude Code
 
+> **Status: Experimental** — This plugin is under active development. APIs, access control behavior, and configuration may change without notice.
+
 A [Claude Code channel](https://code.claude.com/docs/en/channels) plugin that bridges Mattermost to Claude Code. Messages sent in Mattermost arrive in your Claude Code session, and Claude's replies are posted back.
+
+Based on the official [Discord channel plugin](https://github.com/anthropics/claude-plugins-official/tree/main/external_plugins/discord) by Anthropic, adapted for Mattermost's REST API and WebSocket protocol.
 
 ## Prerequisites
 
@@ -99,4 +103,4 @@ The plugin reads from `~/.claude/channels/mattermost/.env` or from the MCP serve
 
 ## License
 
-MIT
+Apache License 2.0 — see [LICENSE.md](LICENSE.md) and [NOTICE](NOTICE).

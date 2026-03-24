@@ -1,0 +1,8 @@
+Mattermost Channel for Claude Code
+Copyright 2026 Jonathan Langford
+
+This project is derived from the Discord channel plugin for Claude Code,
+originally developed by Anthropic, PBC and licensed under the Apache License 2.0.
+
+  https://github.com/anthropics/claude-plugins-official/tree/main/external_plugins/discord
+  Copyright 2026 Anthropic, PBC
