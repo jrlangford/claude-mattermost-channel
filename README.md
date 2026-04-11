@@ -101,6 +101,20 @@ The plugin reads from `~/.claude/channels/mattermost/.env` or from the MCP serve
 | `MM_URL` | No | Mattermost server URL (default: `http://localhost:8065`) |
 | `MM_BOT_TOKEN` | Yes | Bot personal access token |
 | `MM_BOT_USER_ID` | Yes | Bot user ID |
+| `MM_HEARTBEAT_INTERVAL` | No | WebSocket heartbeat interval in seconds (default: `0` = disabled) |
+
+### Heartbeat (remote agents)
+
+When a host sleeps, Docker suspends the container and the Mattermost WebSocket enters a half-open state: the server closes its side, but the client never receives the FIN. On wake, the existing reconnect logic doesn't fire because no `close` event is delivered — and messages sent during the gap are silently dropped.
+
+Set `MM_HEARTBEAT_INTERVAL=30` to enable a protocol-level WebSocket ping every 30 seconds. If no pong is received within 60 seconds (2× the interval), the plugin force-closes the socket and the existing exponential-backoff reconnect runs.
+
+**Local agents** (same host as Mattermost) don't need this — leave it unset.
+**Remote agents** (running in a separate container or VM) should set it in their Docker recipe:
+
+```
+-e MM_HEARTBEAT_INTERVAL=30
+```
 
 ## License
 

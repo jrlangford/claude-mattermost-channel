@@ -51,6 +51,8 @@ type BotState = {
   reconnectDelay: number;
   username: string | null;
   recentSentIds: Set<string>;
+  heartbeatTimer: ReturnType<typeof setInterval> | null;
+  lastPong: number;
 };
 
 // -- Paths --
@@ -173,6 +175,8 @@ for (const config of botConfigs) {
     reconnectDelay: 5000,
     username: null,
     recentSentIds: new Set(),
+    heartbeatTimer: null,
+    lastPong: Date.now(),
   });
   if (config.userId) botUserIds.add(config.userId);
 }
@@ -893,6 +897,11 @@ setInterval(checkApprovals, 5000).unref();
 let shuttingDown = false;
 const MAX_RECONNECT_DELAY = 5 * 60 * 1000; // 5 minutes
 
+// Heartbeat: opt-in via MM_HEARTBEAT_INTERVAL env var (seconds).
+// Intended for remote agents where host sleep causes half-open TCP connections.
+// Local fleet agents leave this unset (disabled).
+const HEARTBEAT_INTERVAL = parseInt(process.env.MM_HEARTBEAT_INTERVAL ?? "0") * 1000;
+
 function connectBot(state: BotState) {
   const { config } = state;
   const wsUrl = config.url.replace(/^http/, "ws") + "/api/v4/websocket";
@@ -913,6 +922,24 @@ function connectBot(state: BotState) {
         data: { token: config.token },
       })
     );
+
+    if (HEARTBEAT_INTERVAL > 0) {
+      if (state.heartbeatTimer) clearInterval(state.heartbeatTimer);
+      state.lastPong = Date.now();
+      ws.addEventListener("pong", () => {
+        state.lastPong = Date.now();
+      });
+      state.heartbeatTimer = setInterval(() => {
+        if (Date.now() - state.lastPong > HEARTBEAT_INTERVAL * 2) {
+          console.error(`mattermost-channel:${label} heartbeat timeout — forcing reconnect`);
+          ws.close();
+          return;
+        }
+        // ws.ping() is a Bun-specific extension (not in the standard WebSocket API).
+        // The server responds with a pong frame, which updates lastPong via the "pong" listener.
+        if (ws.readyState === WebSocket.OPEN) (ws as any).ping();
+      }, HEARTBEAT_INTERVAL);
+    }
   });
 
   ws.addEventListener("message", async (event) => {
@@ -1006,6 +1033,7 @@ function connectBot(state: BotState) {
   });
 
   ws.addEventListener("close", () => {
+    if (state.heartbeatTimer) { clearInterval(state.heartbeatTimer); state.heartbeatTimer = null; }
     if (shuttingDown) return;
     console.error(
       `mattermost-channel:${label} WebSocket closed, reconnecting in ${state.reconnectDelay / 1000}s...`
