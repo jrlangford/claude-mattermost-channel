@@ -521,6 +521,18 @@ async function mmGetChannel(bot: BotConfig, channelId: string): Promise<MMChanne
   return res.json() as Promise<MMChannel>;
 }
 
+async function mmViewChannel(bot: BotConfig, channelId: string): Promise<void> {
+  await mmApi(bot, `/channels/members/${bot.userId}/view`, {
+    method: "POST",
+    body: JSON.stringify({ channel_id: channelId }),
+  });
+}
+
+async function mmGetChannelMember(bot: BotConfig, channelId: string): Promise<{ last_viewed_at: number; msg_count: number }> {
+  const res = await mmApi(bot, `/channels/${channelId}/members/${bot.userId}`);
+  return res.json() as Promise<{ last_viewed_at: number; msg_count: number }>;
+}
+
 // Simple capped map — evicts oldest entry when cap is reached
 function cappedSet<K, V>(map: Map<K, V>, key: K, value: V, cap: number): void {
   map.set(key, value);
@@ -679,7 +691,7 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
     {
       name: "fetch_messages",
       description:
-        "Fetch recent messages from a Mattermost channel. Only works for allowlisted channels.",
+        "Fetch messages from a Mattermost channel. By default fetches only unread messages (since last viewed) and marks the channel as read. Use 'limit' to fetch the latest N messages instead (does not mark as read).",
       inputSchema: {
         type: "object" as const,
         properties: {
@@ -689,11 +701,23 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
           },
           limit: {
             type: "number",
-            description: "Max messages (default 20, max 200)",
+            description: "Fetch the latest N messages instead of unreads (default: fetch unreads only). Does not mark channel as read.",
           },
           ...botParam,
         },
         required: ["channel"],
+      },
+    },
+    {
+      name: "get_unreads",
+      description:
+        "Get unread message counts for all allowlisted channels. Returns only channels with unread messages.",
+      inputSchema: {
+        type: "object" as const,
+        properties: {
+          ...botParam,
+        },
+        required: [],
       },
     },
   ],
@@ -814,14 +838,29 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
 
     case "fetch_messages": {
       const channel = validateId(args.channel, "channel");
-      const limit = Math.max(1, Math.min(Number(args.limit) || 20, 200));
+      const explicitLimit = args.limit ? Math.max(1, Math.min(Number(args.limit), 200)) : undefined;
       const botState = resolveBot(args, channel);
       await verifyOutboundChannel(botState.config, channel);
-      const perPage = limit;
-      const res = await mmApi(
-        botState.config,
-        `/channels/${channel}/posts?per_page=${perPage}`
-      );
+
+      let query: string;
+      let markAsRead = false;
+
+      if (explicitLimit) {
+        // Explicit limit: fetch latest N, don't mark as read
+        query = `/channels/${channel}/posts?per_page=${explicitLimit}`;
+      } else {
+        // Default: fetch unreads only (since last_viewed_at), then mark as read
+        const member = await mmGetChannelMember(botState.config, channel);
+        if (member.last_viewed_at > 0) {
+          query = `/channels/${channel}/posts?since=${member.last_viewed_at}`;
+        } else {
+          // Never viewed — fetch last 50 to avoid dumping entire history
+          query = `/channels/${channel}/posts?per_page=50`;
+        }
+        markAsRead = true;
+      }
+
+      const res = await mmApi(botState.config, query);
       const data = (await res.json()) as MMPostList;
       const posts = data.order
         ?.map((id: string) => data.posts[id]!)
@@ -832,9 +871,55 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
           message: p.message,
           create_at: new Date(p.create_at).toISOString(),
         }));
+
+      if (markAsRead) {
+        await mmViewChannel(botState.config, channel).catch(() => {});
+      }
+
       return {
         content: [
           { type: "text" as const, text: JSON.stringify(posts, null, 2) },
+        ],
+      };
+    }
+
+    case "get_unreads": {
+      const botState = resolveBot(args);
+      // Get all teams, then all channels per team — covers DMs, groups, and public/private channels
+      const teamsRes = await mmApi(botState.config, `/users/me/teams`);
+      const teams = (await teamsRes.json()) as { id: string }[];
+      const allChannelIds: string[] = [];
+      for (const team of teams) {
+        const chRes = await mmApi(botState.config, `/users/me/teams/${team.id}/channels`);
+        const channels = (await chRes.json()) as { id: string }[];
+        for (const ch of channels) allChannelIds.push(ch.id);
+      }
+      const results: { channel_id: string; msg_count: number; mention_count: number }[] = [];
+      for (const channelId of allChannelIds) {
+        try {
+          const res = await mmApi(
+            botState.config,
+            `/users/${botState.config.userId}/channels/${channelId}/unread`
+          );
+          const data = (await res.json()) as {
+            channel_id: string;
+            msg_count: number;
+            mention_count: number;
+          };
+          if (data.msg_count > 0) {
+            results.push({
+              channel_id: data.channel_id,
+              msg_count: data.msg_count,
+              mention_count: data.mention_count,
+            });
+          }
+        } catch {
+          // Skip channels that error
+        }
+      }
+      return {
+        content: [
+          { type: "text" as const, text: JSON.stringify(results, null, 2) },
         ],
       };
     }
@@ -902,6 +987,123 @@ const MAX_RECONNECT_DELAY = 5 * 60 * 1000; // 5 minutes
 // Local fleet agents leave this unset (disabled).
 const HEARTBEAT_INTERVAL = parseInt(process.env.MM_HEARTBEAT_INTERVAL ?? "0") * 1000;
 
+// Process one inbound post — shared by live WS events and reconnect catch-up.
+// Validates, dedupes, gates, and forwards to Claude via MCP notification.
+async function processPost(state: BotState, post: MMPost) {
+  const { config } = state;
+
+  // Validate all IDs at the ingress boundary.
+  if (!post.user_id || !post.channel_id || !post.id) return;
+  if (!MM_ID_RE.test(post.user_id) || !MM_ID_RE.test(post.channel_id) || !MM_ID_RE.test(post.id)) return;
+  if (post.root_id && !MM_ID_RE.test(post.root_id)) return;
+
+  // Ignore messages from any of our bots
+  if (botUserIds.has(post.user_id)) return;
+
+  // Dedup across bots and across live/catch-up paths
+  if (!markDelivered(post.id)) return;
+
+  const senderId = post.user_id;
+  const channelId = post.channel_id;
+  const channelType = await getChannelType(config, channelId);
+  const isDM = channelType === "D" || channelType === "G";
+
+  const result = await gate(state, senderId, channelId, isDM, post.message, post.root_id);
+
+  if (result.action === "drop") return;
+
+  if (result.action === "pair") {
+    const pairMsg = result.isResend
+      ? `Pairing required — run in Claude Code:\n\n\`/mattermost:access pair ${result.code}\``
+      : `Hi! I need to verify your identity before we can chat.\n\nRun this in your Claude Code terminal:\n\n\`/mattermost:access pair ${result.code}\``;
+    await mmPost(config, channelId, pairMsg);
+    return;
+  }
+
+  channelBotMap.set(channelId, config.name);
+
+  pendingMessages.set(channelId, { postId: post.id, botName: config.name });
+  setTimeout(() => {
+    mmViewChannel(config, channelId).catch(() => {});
+    mmReact(config, post.id, "eyes").catch(() => {});
+  }, 1500);
+
+  const username = await getUsername(config, senderId);
+  if (isDM) cappedSet(dmChannelSenders, channelId, senderId, CACHE_CAP);
+
+  const meta: Record<string, string> = {
+    chat_id: channelId,
+    message_id: post.id,
+    user: username,
+    user_id: senderId,
+    ts: new Date(post.create_at).toISOString(),
+  };
+
+  if (multiBot) meta.bot = config.name;
+  if (post.root_id) meta.thread_id = post.root_id;
+  if (post.file_ids?.length) meta.attachment_count = String(post.file_ids.length);
+
+  await mcp.notification({
+    method: "notifications/claude/channel",
+    params: { content: post.message, meta },
+  });
+}
+
+// Fetch messages that arrived while the bot was disconnected and push them
+// through the live delivery pipeline. Runs after WS (re)connect.
+async function catchUpUnreads(state: BotState) {
+  const { config } = state;
+  const label = multiBot ? `[${config.name}]` : "";
+
+  const teamsRes = await mmApi(config, `/users/me/teams`);
+  const teams = (await teamsRes.json()) as { id: string }[];
+
+  const channelIds: string[] = [];
+  for (const team of teams) {
+    const chRes = await mmApi(config, `/users/me/teams/${team.id}/channels`);
+    const channels = (await chRes.json()) as { id: string }[];
+    for (const ch of channels) channelIds.push(ch.id);
+  }
+
+  let totalDelivered = 0;
+  for (const channelId of channelIds) {
+    try {
+      const unreadRes = await mmApi(
+        config,
+        `/users/${config.userId}/channels/${channelId}/unread`
+      );
+      const unread = (await unreadRes.json()) as { msg_count: number };
+      if (unread.msg_count <= 0) continue;
+
+      // Fetch posts since last_viewed_at. Skip never-viewed channels to avoid
+      // dumping full history on first connect.
+      const member = await mmGetChannelMember(config, channelId);
+      if (member.last_viewed_at <= 0) continue;
+
+      const postsRes = await mmApi(
+        config,
+        `/channels/${channelId}/posts?since=${member.last_viewed_at}`
+      );
+      const data = (await postsRes.json()) as MMPostList;
+      const posts = (data.order ?? [])
+        .map((id) => data.posts[id]!)
+        .filter((p): p is MMPost => !!p && !!p.create_at)
+        .sort((a, b) => a.create_at - b.create_at);
+
+      for (const post of posts) {
+        await processPost(state, post);
+        totalDelivered++;
+      }
+    } catch (err) {
+      console.error(`mattermost-channel:${label} catch-up error on channel ${channelId}:`, err);
+    }
+  }
+
+  if (totalDelivered > 0) {
+    console.error(`mattermost-channel:${label} catch-up delivered ${totalDelivered} post(s)`);
+  }
+}
+
 function connectBot(state: BotState) {
   const { config } = state;
   const wsUrl = config.url.replace(/^http/, "ws") + "/api/v4/websocket";
@@ -940,6 +1142,12 @@ function connectBot(state: BotState) {
         if (ws.readyState === WebSocket.OPEN) (ws as any).ping();
       }, HEARTBEAT_INTERVAL);
     }
+
+    // Catch up on messages missed while disconnected. REST is independent of
+    // WS auth — dedup (markDelivered) handles any overlap with live events.
+    catchUpUnreads(state).catch((err) =>
+      console.error(`mattermost-channel:${label} catch-up failed:`, err)
+    );
   });
 
   ws.addEventListener("message", async (event) => {
@@ -951,82 +1159,7 @@ function connectBot(state: BotState) {
       if (msg.event !== "posted") return;
 
       const post = JSON.parse(msg.data.post);
-
-      // Validate all IDs from the WebSocket at the ingress boundary.
-      // A malicious/compromised Mattermost server could send crafted IDs
-      // that cause path traversal, API path injection, or cache poisoning.
-      if (!post.user_id || !post.channel_id || !post.id) return;
-      if (!MM_ID_RE.test(post.user_id) || !MM_ID_RE.test(post.channel_id) || !MM_ID_RE.test(post.id)) return;
-      if (post.root_id && !MM_ID_RE.test(post.root_id)) return;
-
-      // Ignore messages from any of our bots
-      if (botUserIds.has(post.user_id)) return;
-
-      // Dedup across bots — only the first bot to process delivers
-      if (!markDelivered(post.id)) return;
-
-      const senderId: string = post.user_id;
-      const channelId: string = post.channel_id;
-      const channelType = await getChannelType(config, channelId);
-      const isDM = channelType === "D" || channelType === "G";
-
-      // Gate the message
-      const result = await gate(state, senderId, channelId, isDM, post.message, post.root_id);
-
-      if (result.action === "drop") {
-        return; // silently ignore
-      }
-
-      if (result.action === "pair") {
-        // Send pairing instructions
-        const pairMsg = result.isResend
-          ? `Pairing required — run in Claude Code:\n\n\`/mattermost:access pair ${result.code}\``
-          : `Hi! I need to verify your identity before we can chat.\n\nRun this in your Claude Code terminal:\n\n\`/mattermost:access pair ${result.code}\``;
-        await mmPost(config, channelId, pairMsg);
-        return;
-      }
-
-      // action === "deliver" — forward to Claude
-      // Route this channel through this bot for future outbound messages
-      channelBotMap.set(channelId, config.name);
-
-      // React with 👀 to signal we've seen it, then typing indicator
-      pendingMessages.set(channelId, { postId: post.id, botName: config.name });
-      setTimeout(() => {
-        mmReact(config, post.id, "eyes").catch(() => {});
-        setTimeout(() => mmSendTyping(config, channelId).catch(() => {}), 500);
-      }, 1500);
-
-      const username = await getUsername(config, senderId);
-      if (isDM) cappedSet(dmChannelSenders, channelId, senderId, CACHE_CAP);
-
-      const meta: Record<string, string> = {
-        chat_id: channelId,
-        message_id: post.id,
-        user: username,
-        user_id: senderId,
-        ts: new Date(post.create_at).toISOString(),
-      };
-
-      if (multiBot) {
-        meta.bot = config.name;
-      }
-
-      if (post.root_id) {
-        meta.thread_id = post.root_id;
-      }
-
-      if (post.file_ids?.length) {
-        meta.attachment_count = String(post.file_ids.length);
-      }
-
-      await mcp.notification({
-        method: "notifications/claude/channel",
-        params: {
-          content: post.message,
-          meta,
-        },
-      });
+      await processPost(state, post);
     } catch (err) {
       console.error(`mattermost-channel:${label} error processing message:`, err);
     }
