@@ -1164,9 +1164,20 @@ function connectBot(state: BotState) {
 
     // Catch up on messages missed while disconnected. REST is independent of
     // WS auth — dedup (markDelivered) handles any overlap with live events.
-    catchUpUnreads(state).catch((err) =>
-      console.error(`mattermost-channel:${label} catch-up failed:`, err)
-    );
+    //
+    // Delayed by 3s on every WS open. Avoids a race during *first* connect
+    // where mcp.notification can fire before claude's binary has finished
+    // post-init work (EM$ gate evaluation + setNotificationHandler
+    // registration for `notifications/claude/channel`) — the notification
+    // arrives at the MCP transport with no handler bound and is silently
+    // dropped, so a wake-on-MM message never surfaces in the agent's session.
+    // 3s gives claude enough headroom to register the handler. The same
+    // delay on reconnect is harmless (handler already registered there).
+    setTimeout(() => {
+      catchUpUnreads(state).catch((err) =>
+        console.error(`mattermost-channel:${label} catch-up failed:`, err)
+      );
+    }, 3000);
   });
 
   ws.addEventListener("message", async (event) => {
