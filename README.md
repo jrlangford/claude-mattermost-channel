@@ -92,6 +92,65 @@ The plugin exposes these tools to Claude:
 | `react` | Add an emoji reaction |
 | `fetch_messages` | Fetch recent messages from a channel |
 
+## Codex SDK Bridge
+
+This repo also includes an experimental Codex version that runs as a standalone
+Mattermost bot bridge. It uses `@openai/codex-sdk` to create or resume one
+Codex thread per Mattermost DM or group thread, then posts Codex's final
+response back to Mattermost.
+
+### Codex setup
+
+Create `~/.codex/mattermost/bots.json`:
+
+```json
+[
+  {
+    "name": "default",
+    "url": "https://mattermost.example.com",
+    "token": "abc123...",
+    "userId": "def456..."
+  }
+]
+```
+
+Then run:
+
+```bash
+bun install
+bun codex-server.ts
+```
+
+You can also use the same `MM_URL`, `MM_BOT_TOKEN`, and `MM_BOT_USER_ID`
+environment variables instead of `bots.json`.
+
+Pairing and access control use `~/.codex/mattermost/access.json`:
+
+```bash
+bun codex-access-cli.ts
+bun codex-access-cli.ts pair <code>
+bun codex-access-cli.ts policy allowlist
+```
+
+Useful Codex bridge environment variables:
+
+| Variable | Description |
+|----------|-------------|
+| `CODEX_MODEL` | Model override passed to the Codex SDK thread |
+| `CODEX_WORKING_DIRECTORY` | Working directory for Codex turns |
+| `CODEX_SANDBOX_MODE` | `read-only`, `workspace-write`, or `danger-full-access` |
+| `CODEX_APPROVAL_POLICY` | `never`, `on-request`, `on-failure`, or `untrusted` |
+| `CODEX_MODEL_REASONING_EFFORT` | `minimal`, `low`, `medium`, `high`, or `xhigh` |
+| `CODEX_WEB_SEARCH_MODE` | `disabled`, `cached`, or `live` |
+| `CODEX_NETWORK_ACCESS` | Set to `1` to enable network access for Codex |
+| `CODEX_MATTERMOST_HOME` | Override the default `~/.codex/mattermost` state directory |
+| `CODEX_PATH` | Path to a specific Codex CLI binary |
+| `CODEX_MCP_CONFIG_JSON` | JSON object of Codex MCP servers passed as `config.mcp_servers` |
+
+The Codex bridge preserves the original DM pairing, allowlist, group opt-in,
+multi-bot, unread catch-up, and heartbeat behavior. It does not use Claude
+Code's `notifications/claude/channel` MCP extension.
+
 ## Environment Variables
 
 The plugin reads from `~/.claude/channels/mattermost/.env` or from the MCP server environment:

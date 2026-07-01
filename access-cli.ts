@@ -24,7 +24,9 @@ import {
 import { join } from "path";
 import { homedir } from "os";
 
-const CHANNELS_DIR = join(homedir(), ".claude", "channels", "mattermost");
+const CHANNELS_DIR =
+  process.env.MATTERMOST_CHANNEL_HOME ||
+  join(homedir(), ".claude", "channels", "mattermost");
 const ACCESS_FILE = join(CHANNELS_DIR, "access.json");
 const APPROVED_DIR = join(CHANNELS_DIR, "approved");
 
