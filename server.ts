@@ -53,6 +53,11 @@ type BotState = {
   recentSentIds: Set<string>;
   heartbeatTimer: ReturnType<typeof setInterval> | null;
   lastPong: number;
+  /** Live posts arriving before the client has bound the channel-notification
+   *  handler are buffered here and flushed 3s after first WS open (same
+   *  headroom the catch-up path uses). null once flushed — reconnects don't
+   *  buffer (handler already registered). */
+  liveBuffer: MMPost[] | null;
 };
 
 // -- Paths --
@@ -177,6 +182,7 @@ for (const config of botConfigs) {
     recentSentIds: new Set(),
     heartbeatTimer: null,
     lastPong: Date.now(),
+    liveBuffer: [],
   });
   if (config.userId) botUserIds.add(config.userId);
 }
@@ -576,6 +582,11 @@ function markDelivered(postId: string): boolean {
     if (first) deliveredMessages.delete(first);
   }
   return true; // first delivery
+}
+
+// Undo dedup when a delivery attempt fails so catch-up can re-deliver.
+function unmarkDelivered(postId: string): void {
+  deliveredMessages.delete(postId);
 }
 
 // Channel type cache: D = direct message, O = open, P = private, G = group
@@ -1041,12 +1052,6 @@ async function processPost(state: BotState, post: MMPost) {
 
   channelBotMap.set(channelId, config.name);
 
-  pendingMessages.set(channelId, { postId: post.id, botName: config.name });
-  setTimeout(() => {
-    mmViewChannel(config, channelId).catch(() => {});
-    mmReact(config, post.id, "eyes").catch(() => {});
-  }, 1500);
-
   const username = await getUsername(config, senderId);
   if (isDM) cappedSet(dmChannelSenders, channelId, senderId, CACHE_CAP);
 
@@ -1062,10 +1067,35 @@ async function processPost(state: BotState, post: MMPost) {
   if (post.root_id) meta.thread_id = post.root_id;
   if (post.file_ids?.length) meta.attachment_count = String(post.file_ids.length);
 
-  await mcp.notification({
-    method: "notifications/claude/channel",
-    params: { content: post.message, meta },
-  });
+  try {
+    await mcp.notification({
+      method: "notifications/claude/channel",
+      params: { content: post.message, meta },
+    });
+  } catch (err) {
+    // Delivery failed (transport torn down, e.g. mid connection recycle).
+    // Undo the dedup and leave the channel UNREAD so catch-up on the next
+    // connection re-fetches and re-delivers instead of silently losing it.
+    // (A hard transport death raises EPIPE as an uncaught exception instead —
+    // the top-level handler exits; the unfired view timer below is then moot
+    // because it was never scheduled, and the message likewise stays unread.)
+    unmarkDelivered(post.id);
+    console.error(
+      `mattermost-channel: notification failed for post ${post.id}; leaving unread for catch-up:`,
+      err,
+    );
+    return;
+  }
+
+  // Only after delivery is confirmed: mark viewed + 👀. The 1500ms is a
+  // read-receipt UX delay, not a delivery gate — mark-viewed must never
+  // precede a successful notification (marking read makes the post
+  // invisible to catch-up's since=last_viewed_at fetch, i.e. lost).
+  pendingMessages.set(channelId, { postId: post.id, botName: config.name });
+  setTimeout(() => {
+    mmViewChannel(config, channelId).catch(() => {});
+    mmReact(config, post.id, "eyes").catch(() => {});
+  }, 1500);
 }
 
 // Fetch messages that arrived while the bot was disconnected and push them
@@ -1173,10 +1203,30 @@ function connectBot(state: BotState) {
     // dropped, so a wake-on-MM message never surfaces in the agent's session.
     // 3s gives claude enough headroom to register the handler. The same
     // delay on reconnect is harmless (handler already registered there).
+    //
+    // The same 3s window also gates LIVE posts on first connect (see
+    // state.liveBuffer): a live post delivered inside the handler-race window
+    // would "succeed" at the transport level, be dropped by the client, and
+    // then get marked read — the one loss mode the delivery-gated view
+    // reorder can't catch. Buffer, then flush through the normal pipeline.
     setTimeout(() => {
       catchUpUnreads(state).catch((err) =>
         console.error(`mattermost-channel:${label} catch-up failed:`, err)
       );
+      if (state.liveBuffer !== null) {
+        const buffered = state.liveBuffer;
+        state.liveBuffer = null;
+        if (buffered.length > 0) {
+          console.error(
+            `mattermost-channel:${label} flushing ${buffered.length} live post(s) buffered during first-connect window`
+          );
+        }
+        for (const p of buffered) {
+          processPost(state, p).catch((err) =>
+            console.error(`mattermost-channel:${label} buffered-post delivery failed:`, err)
+          );
+        }
+      }
     }, 3000);
   });
 
@@ -1189,6 +1239,11 @@ function connectBot(state: BotState) {
       if (msg.event !== "posted") return;
 
       const post = JSON.parse(msg.data.post);
+      if (state.liveBuffer !== null) {
+        // First-connect handler-race window — hold for the 3s flush.
+        state.liveBuffer.push(post);
+        return;
+      }
       await processPost(state, post);
     } catch (err) {
       console.error(`mattermost-channel:${label} error processing message:`, err);
