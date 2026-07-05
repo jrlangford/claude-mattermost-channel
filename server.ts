@@ -534,6 +534,35 @@ async function mmViewChannel(bot: BotConfig, channelId: string): Promise<void> {
   });
 }
 
+// A failed view leaves the read pointer stale: the next catch-up re-fetches
+// already-delivered posts and redelivers them — safe under at-least-once, but
+// a fresh-context agent will re-answer. Never swallow view failures silently;
+// retry with backoff and log the final give-up so stale-pointer redeliveries
+// are diagnosable. Never throws — callers may fire-and-forget.
+async function mmViewChannelRetry(bot: BotConfig, channelId: string): Promise<void> {
+  const attempts = 3;
+  for (let i = 1; i <= attempts; i++) {
+    try {
+      await mmViewChannel(bot, channelId);
+      if (i > 1) {
+        console.error(
+          `mattermost-channel: view of channel ${channelId} succeeded on attempt ${i}`,
+        );
+      }
+      return;
+    } catch (err) {
+      if (i === attempts) {
+        console.error(
+          `mattermost-channel: view of channel ${channelId} failed after ${attempts} attempts — read pointer stale, expect catch-up redelivery:`,
+          err,
+        );
+        return;
+      }
+      await new Promise((r) => setTimeout(r, 1000 * i));
+    }
+  }
+}
+
 async function mmGetChannelMember(bot: BotConfig, channelId: string): Promise<{ last_viewed_at: number; msg_count: number }> {
   const res = await mmApi(bot, `/channels/${channelId}/members/${bot.userId}`);
   return res.json() as Promise<{ last_viewed_at: number; msg_count: number }>;
@@ -903,7 +932,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
         }));
 
       if (markAsRead) {
-        await mmViewChannel(botState.config, channel).catch(() => {});
+        await mmViewChannelRetry(botState.config, channel);
       }
 
       return {
@@ -1093,7 +1122,7 @@ async function processPost(state: BotState, post: MMPost) {
   // invisible to catch-up's since=last_viewed_at fetch, i.e. lost).
   pendingMessages.set(channelId, { postId: post.id, botName: config.name });
   setTimeout(() => {
-    mmViewChannel(config, channelId).catch(() => {});
+    mmViewChannelRetry(config, channelId);
     mmReact(config, post.id, "eyes").catch(() => {});
   }, 1500);
 }
