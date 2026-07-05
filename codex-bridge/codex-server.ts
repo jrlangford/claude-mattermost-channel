@@ -99,7 +99,9 @@ type Access = {
   pending: Record<string, PendingEntry>;
 };
 
-type ThreadStore = Record<string, string>;
+type ThreadEntry = { id: string; lastUsedAt: number };
+// Legacy stores held bare thread-id strings; getThread migrates them.
+type ThreadStore = Record<string, ThreadEntry | string>;
 
 const DEFAULT_ACCESS: Access = {
   dmPolicy: "pairing",
@@ -108,8 +110,11 @@ const DEFAULT_ACCESS: Access = {
   pending: {},
 };
 
+// Codex state honors only CODEX_MATTERMOST_HOME. The Claude bridge's
+// MATTERMOST_CHANNEL_HOME is deliberately not read here: one variable
+// spanning both bridges could point them at the same allowlist/state
+// directory (same token connected twice, cross-managed allowlists).
 const CHANNELS_DIR =
-  process.env.MATTERMOST_CHANNEL_HOME ||
   process.env.CODEX_MATTERMOST_HOME ||
   join(homedir(), ".codex", "mattermost");
 const BOTS_FILE = join(CHANNELS_DIR, "bots.json");
@@ -241,11 +246,25 @@ function firstBot(): BotState {
   return first;
 }
 
-function getBotForChannel(channelId: string): BotState {
+async function resolveBotForChannel(channelId: string): Promise<BotState> {
   const name = channelBotMap.get(channelId);
   if (name) {
     const bot = bots.get(name);
     if (bot) return bot;
+  }
+  if (multiBot) {
+    // Unknown channel (e.g. an approval for a chat not seen since boot):
+    // probe membership so the confirmation posts from the right bot rather
+    // than arbitrarily from the first one.
+    for (const bot of bots.values()) {
+      try {
+        const res = await mmApi(bot.config, `/channels/${channelId}/members/${bot.config.userId}`);
+        if (res.ok) return bot;
+      } catch {}
+    }
+    console.error(
+      `mattermost-codex: no bot is a member of channel ${channelId}; falling back to first bot`
+    );
   }
   return firstBot();
 }
@@ -329,12 +348,6 @@ async function mmReact(bot: BotConfig, postId: string, emoji: string) {
   return res.json();
 }
 
-async function mmUnreact(bot: BotConfig, postId: string, emoji: string) {
-  await mmApi(bot, `/users/${bot.userId}/posts/${postId}/reactions/${emoji}`, {
-    method: "DELETE",
-  });
-}
-
 async function mmGetUser(bot: BotConfig, userId: string): Promise<MMUser> {
   const res = await mmApi(bot, `/users/${userId}`);
   return res.json() as Promise<MMUser>;
@@ -379,7 +392,6 @@ async function getUsername(bot: BotConfig, userId: string): Promise<string> {
 }
 
 const dmChannelSenders = new Map<string, string>();
-const pendingMessages = new Map<string, { postId: string; botName: string }>();
 const deliveredMessages = new Set<string>();
 const DELIVERED_CAP = 500;
 
@@ -391,6 +403,11 @@ function markDelivered(postId: string): boolean {
     if (first) deliveredMessages.delete(first);
   }
   return true;
+}
+
+// Undo dedup when a delivery attempt fails so catch-up can re-deliver.
+function unmarkDelivered(postId: string): void {
+  deliveredMessages.delete(postId);
 }
 
 const channelTypeCache = new Map<string, string>();
@@ -575,8 +592,18 @@ const threadOptions: ThreadOptions = {
   ...(process.env.CODEX_NETWORK_ACCESS === "1" ? { networkAccessEnabled: true } : {}),
 };
 
-const threads = new Map<string, Thread>();
+const threads = new Map<string, { thread: Thread; lastUsedAt: number }>();
 const queues = new Map<string, Promise<void>>();
+
+// Long-idle Codex threads resume with their full context re-sent, so cap the
+// idle age: past it the conversation starts a fresh thread. Set to 0 to
+// disable expiry.
+const THREAD_MAX_IDLE_MS =
+  (parseFloat(process.env.CODEX_THREAD_MAX_IDLE_HOURS ?? "72") || 0) * 60 * 60 * 1000;
+
+function threadExpired(lastUsedAt: number): boolean {
+  return THREAD_MAX_IDLE_MS > 0 && Date.now() - lastUsedAt > THREAD_MAX_IDLE_MS;
+}
 
 function conversationKey(channelId: string, isDM: boolean, post: MMPost): string {
   if (isDM) return `dm:${channelId}`;
@@ -584,24 +611,33 @@ function conversationKey(channelId: string, isDM: boolean, post: MMPost): string
 }
 
 function getThread(key: string): Thread {
-  const existing = threads.get(key);
-  if (existing) return existing;
+  const cached = threads.get(key);
+  if (cached && !threadExpired(cached.lastUsedAt)) {
+    cached.lastUsedAt = Date.now();
+    return cached.thread;
+  }
 
   const store = readThreadStore();
-  const savedId = store[key];
-  const thread = savedId
-    ? codex.resumeThread(savedId, threadOptions)
-    : codex.startThread(threadOptions);
-  threads.set(key, thread);
+  const saved = store[key];
+  // Legacy entries are bare id strings with no timestamp; treat them as
+  // fresh once — they pick up a real timestamp on the next save.
+  const savedId = typeof saved === "string" ? saved : saved ? saved.id : undefined;
+  const lastUsedAt = typeof saved === "object" && saved ? saved.lastUsedAt : Date.now();
+  const thread =
+    savedId && !threadExpired(lastUsedAt)
+      ? codex.resumeThread(savedId, threadOptions)
+      : codex.startThread(threadOptions);
+  threads.set(key, { thread, lastUsedAt: Date.now() });
   return thread;
 }
 
 function rememberThread(key: string, thread: Thread): void {
   if (!thread.id) return;
   const store = readThreadStore();
-  if (store[key] === thread.id) return;
-  store[key] = thread.id;
+  store[key] = { id: thread.id, lastUsedAt: Date.now() };
   saveThreadStore(store);
+  const cached = threads.get(key);
+  if (cached) cached.lastUsedAt = Date.now();
 }
 
 function mattermostPrompt(args: {
@@ -635,8 +671,43 @@ Mattermost message:
 ${args.text}`;
 }
 
-async function runCodexForPost(state: BotState, post: MMPost, isDM: boolean, username: string): Promise<void> {
+async function markViewedWithRetry(bot: BotConfig, channelId: string): Promise<void> {
+  for (let attempt = 1; ; attempt++) {
+    try {
+      await mmViewChannel(bot, channelId);
+      return;
+    } catch (err) {
+      console.error(
+        `mattermost-codex: mark-viewed failed for channel ${channelId} (attempt ${attempt}):`,
+        err
+      );
+      if (attempt >= 2) return; // stays unread; catch-up may redeliver (dedup absorbs it)
+      await new Promise((r) => setTimeout(r, 2000));
+    }
+  }
+}
+
+// Mark-read is delivery-gated: it runs only after the turn's response has
+// actually been posted back to Mattermost. Marking a channel read makes the
+// post invisible to catch-up's since=last_viewed_at fetch, so doing it before
+// delivery turns a crash mid-turn into silent permanent loss (same fix as
+// server.ts 3a3c855). The 1.5s is read-receipt UX, not a delivery gate.
+function scheduleReadReceipt(state: BotState, post: MMPost): void {
+  setTimeout(() => {
+    void markViewedWithRetry(state.config, post.channel_id);
+    mmReact(state.config, post.id, "eyes").catch(() => {});
+  }, 1500);
+}
+
+/**
+ * Enqueue a Codex turn for this conversation. Returns once the turn is
+ * queued — NOT once it completes — so callers (live WS handler, catch-up
+ * loop) never serialize on multi-minute Codex turns. Per-conversation
+ * ordering is preserved by the promise chain in `queues`.
+ */
+function enqueueCodexTurn(state: BotState, post: MMPost, isDM: boolean, username: string): void {
   const key = conversationKey(post.channel_id, isDM, post);
+  const replyTo = isDM ? post.root_id : post.root_id || post.id;
   const prior = queues.get(key) ?? Promise.resolve();
   const next = prior
     .catch(() => {})
@@ -658,24 +729,35 @@ async function runCodexForPost(state: BotState, post: MMPost, isDM: boolean, use
       rememberThread(key, thread);
 
       const response = turn.finalResponse.trim();
-      if (!response) {
+      if (response) {
+        const sent = await mmPost(state.config, post.channel_id, response, replyTo);
+        if (sent.id) noteSent(state, sent.id);
+      } else {
         console.error(`mattermost-codex: Codex produced no final response for ${post.id}`);
-        return;
       }
 
-      const replyTo = isDM ? post.root_id : post.root_id || post.id;
-      const sent = await mmPost(state.config, post.channel_id, response, replyTo);
-      if (sent.id) noteSent(state, sent.id);
+      // Only after the response is posted (or the turn completed with
+      // nothing to say): mark viewed + 👀.
+      scheduleReadReceipt(state, post);
     })
     .catch(async (err) => {
+      // Turn or response post failed: undo dedup and leave the channel
+      // UNREAD so catch-up re-delivers (at-least-once; dedup absorbs
+      // overlap). The error notice must not mark the original read either.
+      unmarkDelivered(post.id);
       const detail = err instanceof Error ? err.message : String(err);
-      console.error("mattermost-codex: Codex turn failed:", detail);
-      const replyTo = isDM ? post.root_id : post.root_id || post.id;
+      console.error(
+        `mattermost-codex: Codex turn failed for ${post.id}; leaving channel unread for catch-up:`,
+        detail
+      );
       await mmPost(state.config, post.channel_id, "Codex failed while handling that message.", replyTo).catch(() => {});
     });
 
   queues.set(key, next);
-  await next;
+  // Prune settled chains so `queues` doesn't grow one entry per conversation forever.
+  void next.finally(() => {
+    if (queues.get(key) === next) queues.delete(key);
+  });
 }
 
 async function processPost(state: BotState, post: MMPost) {
@@ -697,37 +779,24 @@ async function processPost(state: BotState, post: MMPost) {
 
   if (result.action === "pair") {
     const pairMsg = result.isResend
-      ? `Pairing required - run in this repository:\n\n\`bun codex-access-cli.ts pair ${result.code}\``
-      : `Hi! I need to verify your identity before we can chat.\n\nRun this in this repository:\n\n\`bun codex-access-cli.ts pair ${result.code}\``;
+      ? `Pairing required - run in this repository:\n\n\`bun codex-bridge/codex-access-cli.ts pair ${result.code}\``
+      : `Hi! I need to verify your identity before we can chat.\n\nRun this in this repository:\n\n\`bun codex-bridge/codex-access-cli.ts pair ${result.code}\``;
     await mmPost(config, channelId, pairMsg);
     return;
   }
 
   channelBotMap.set(channelId, config.name);
-  pendingMessages.set(channelId, { postId: post.id, botName: config.name });
-  setTimeout(() => {
-    mmViewChannel(config, channelId).catch(() => {});
-    mmReact(config, post.id, "eyes").catch(() => {});
-  }, 1500);
 
   const username = await getUsername(config, senderId);
   if (isDM) cappedSet(dmChannelSenders, channelId, senderId, CACHE_CAP);
 
-  try {
-    await runCodexForPost(state, post, isDM, username);
-  } finally {
-    const pending = pendingMessages.get(channelId);
-    if (pending?.postId === post.id) {
-      pendingMessages.delete(channelId);
-      const pendingBot = bots.get(pending.botName);
-      if (pendingBot) {
-        void mmUnreact(pendingBot.config, pending.postId, "eyes").catch(() => {});
-      }
-    }
-  }
+  // Queued, not awaited: catch-up across N conversations must not serialize
+  // on multi-minute Codex turns. Mark-read + 👀 happen inside the queued
+  // task, only after the response has been posted.
+  enqueueCodexTurn(state, post, isDM, username);
 }
 
-function checkApprovals() {
+async function checkApprovals() {
   try {
     const files = readdirSync(APPROVED_DIR);
     for (const senderId of files) {
@@ -742,7 +811,7 @@ function checkApprovals() {
         rmSync(file, { force: true });
         continue;
       }
-      const routed = getBotForChannel(chatId);
+      const routed = await resolveBotForChannel(chatId);
       mmPost(routed.config, chatId, "Paired! You can now send messages to Codex.").catch(
         (err) => console.error("mattermost-codex: approval confirmation failed:", err)
       );
@@ -766,7 +835,7 @@ async function catchUpUnreads(state: BotState) {
     for (const ch of channels) channelIds.push(ch.id);
   }
 
-  let totalDelivered = 0;
+  let totalQueued = 0;
   for (const channelId of channelIds) {
     try {
       const unreadRes = await mmApi(config, `/users/${config.userId}/channels/${channelId}/unread`);
@@ -783,17 +852,19 @@ async function catchUpUnreads(state: BotState) {
         .filter((p): p is MMPost => !!p && !!p.create_at)
         .sort((a, b) => a.create_at - b.create_at);
 
+      // processPost enqueues the Codex turn without awaiting it, so one
+      // conversation's multi-minute backlog can't starve later channels.
       for (const post of posts) {
         await processPost(state, post);
-        totalDelivered++;
+        totalQueued++;
       }
     } catch (err) {
       console.error(`mattermost-codex:${label} catch-up error on channel ${channelId}:`, err);
     }
   }
 
-  if (totalDelivered > 0) {
-    console.error(`mattermost-codex:${label} catch-up delivered ${totalDelivered} post(s)`);
+  if (totalQueued > 0) {
+    console.error(`mattermost-codex:${label} catch-up queued ${totalQueued} post(s)`);
   }
 }
 
