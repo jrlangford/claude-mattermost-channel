@@ -780,6 +780,23 @@ function validateId(value: unknown, name: string): string {
   return s;
 }
 
+// Models sometimes drift to a 'message' key instead of the schema's 'text';
+// the MCP client does not enforce required params, so without this guard the
+// content coerces to "" and posts as an empty message with a success result
+// (2026-07-06 pixel incident: a session's every send ghosted, including a
+// review completion report and a SLEEP_READY handshake ack). Accept the
+// alias, reject blank. The error text must start with "invalid " to pass
+// the catch-block sanitizer and reach the model.
+function validateText(args: Record<string, unknown>): string {
+  const text = String(args.text ?? args.message ?? "");
+  if (text.trim().length === 0) {
+    throw new Error(
+      "invalid text: required and non-empty — nothing was posted. Put the message content in the 'text' argument and resend.",
+    );
+  }
+  return text;
+}
+
 function validateEmoji(value: unknown): string {
   const s = String(value ?? "");
   if (!EMOJI_RE.test(s)) throw new Error(`invalid emoji name: ${s}`);
@@ -825,7 +842,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
   switch (req.params.name) {
     case "reply": {
       const chat_id = validateId(args.chat_id, "chat_id");
-      const text = String(args.text ?? "");
+      const text = validateText(args);
       const reply_to = args.reply_to ? validateId(args.reply_to, "reply_to") : undefined;
       const botState = resolveBot(args, chat_id);
       const bot = botState.config;
@@ -862,7 +879,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
 
     case "edit_message": {
       const message_id = validateId(args.message_id, "message_id");
-      const text = String(args.text ?? "");
+      const text = validateText(args);
       // Determine which bot owns this post
       const firstBot = bots.values().next().value!;
       const original = await mmGetPost(firstBot.config, message_id);
