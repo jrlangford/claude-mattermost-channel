@@ -27,6 +27,7 @@ import {
 } from "fs";
 import { join } from "path";
 import { homedir } from "os";
+import { selectCatchUpPosts } from "./catchup.ts";
 
 // -- Crash handlers — log and keep serving instead of dying silently --
 process.on("unhandledRejection", (err) => {
@@ -1180,10 +1181,9 @@ async function catchUpUnreads(state: BotState) {
         `/channels/${channelId}/posts?since=${member.last_viewed_at}`
       );
       const data = (await postsRes.json()) as MMPostList;
-      const posts = (data.order ?? [])
-        .map((id) => data.posts[id]!)
-        .filter((p): p is MMPost => !!p && !!p.create_at)
-        .sort((a, b) => a.create_at - b.create_at);
+      // Cutoff on create_at: the since-fetch matches on update_at, so it also
+      // returns old posts our own 👀 add/remove re-touched (see catchup.ts).
+      const posts = selectCatchUpPosts(data, member.last_viewed_at);
 
       for (const post of posts) {
         await processPost(state, post);

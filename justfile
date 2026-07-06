@@ -15,6 +15,8 @@ claude-channel:
 access *ARGS:
     cd {{project_dir}} && bun access-cli.ts {{ARGS}}
 
-# Type-check / smoke: bun can parse the server.
+# Type-check / smoke + unit tests.
 check:
-    bun build {{project_dir}}/server.ts --target=bun --outfile=/tmp/mm-channel-check.js && rm /tmp/mm-channel-check.js && echo "check OK"
+    bun build {{project_dir}}/server.ts --target=bun --outfile=/tmp/mm-channel-check.js && rm /tmp/mm-channel-check.js
+    cd {{project_dir}} && bun test
+    @echo "check OK"
