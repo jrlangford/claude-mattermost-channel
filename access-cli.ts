@@ -24,7 +24,9 @@ import {
 import { join } from "path";
 import { homedir } from "os";
 
-const CHANNELS_DIR = join(homedir(), ".claude", "channels", "mattermost");
+// CLAUDE_CONFIG_DIR-aware: isolated profiles get isolated comms credentials
+const CONFIG_ROOT = process.env.CLAUDE_CONFIG_DIR || join(homedir(), ".claude");
+const CHANNELS_DIR = join(CONFIG_ROOT, "channels", "mattermost");
 const ACCESS_FILE = join(CHANNELS_DIR, "access.json");
 const APPROVED_DIR = join(CHANNELS_DIR, "approved");
 
