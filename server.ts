@@ -1173,19 +1173,23 @@ async function catchUpUnreads(state: BotState) {
       const unread = (await unreadRes.json()) as { msg_count: number };
       if (unread.msg_count <= 0) continue;
 
-      // Fetch posts since last_viewed_at. Skip never-viewed channels to avoid
-      // dumping full history on first connect.
+      // Fetch posts since last_viewed_at. Never-viewed channels (a brand-new
+      // DM from a first-time correspondent while we were down) get a capped
+      // tail instead of a skip — skipping silently loses the first message a
+      // new user ever sends to a sleeping agent. The cap keeps a long
+      // pre-existing history (new agent added to a busy channel) from dumping.
       const member = await mmGetChannelMember(config, channelId);
-      if (member.last_viewed_at <= 0) continue;
-
+      const neverViewed = member.last_viewed_at <= 0;
       const postsRes = await mmApi(
         config,
-        `/channels/${channelId}/posts?since=${member.last_viewed_at}`
+        neverViewed
+          ? `/channels/${channelId}/posts?per_page=20`
+          : `/channels/${channelId}/posts?since=${member.last_viewed_at}`
       );
       const data = (await postsRes.json()) as MMPostList;
       // Cutoff on create_at: the since-fetch matches on update_at, so it also
       // returns old posts our own 👀 add/remove re-touched (see catchup.ts).
-      const posts = selectCatchUpPosts(data, member.last_viewed_at);
+      const posts = selectCatchUpPosts(data, neverViewed ? 0 : member.last_viewed_at);
 
       for (const post of posts) {
         await processPost(state, post);
