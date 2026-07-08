@@ -9,10 +9,11 @@ This directory is a self-contained package in the dependency sense: its
 dependencies (including `@openai/codex-sdk`) are isolated from the Claude
 plugin at the repo root, so pure-Claude installs never pull the Codex SDK.
 
-> **Note:** the bridge does import two dependency-free modules from the repo
-> root (`../access-cli.ts` via the access CLI wrapper, and `../catchup.ts`
-> for catch-up post selection), so the `bin` entries are not
-> standalone-installable — run the bridge from a full checkout of this repo.
+> **Note:** the bridge does import a few dependency-free modules from the
+> repo root (`../access-cli.ts` via the access CLI wrapper, `../catchup.ts`
+> for catch-up post selection, and `../files.ts` for attachment handling),
+> so the `bin` entries are not standalone-installable — run the bridge from
+> a full checkout of this repo.
 
 ## Setup
 
@@ -69,6 +70,18 @@ Codex trust domains.
 | `CODEX_THREAD_MAX_IDLE_HOURS` | Idle age after which a stored Codex thread is abandoned and the conversation starts fresh (default `72`; `0` disables expiry) |
 | `CODEX_PATH` | Path to a specific Codex CLI binary |
 | `CODEX_MCP_CONFIG_JSON` | JSON object of Codex MCP servers passed as `config.mcp_servers` |
+| `MM_MAX_FILE_MB` | Per-file cap for inbound attachment downloads (default `50`) |
+
+## Attachments
+
+Codex has no tool surface back into the bridge, so inbound attachments are
+downloaded eagerly — only for messages that already passed the
+pairing/allowlist gate — into `<state-dir>/downloads/<file-id>-<name>`
+(names sanitized, files capped at `MM_MAX_FILE_MB`), and Codex receives the
+local paths in the prompt, flagged as untrusted sender input. A file that
+fails to download or exceeds the cap is reported in the prompt without
+failing the turn. Sending attachments back is not supported: Codex's final
+response is posted as text only.
 
 ## Delivery semantics
 
