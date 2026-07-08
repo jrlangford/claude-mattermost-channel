@@ -87,10 +87,24 @@ The plugin exposes these tools to Claude:
 
 | Tool | Description |
 |------|-------------|
-| `reply` | Send a message to a channel (with optional `reply_to` for threading) |
+| `reply` | Send a message to a channel (optional `reply_to` for threading, `files` to attach local files) |
 | `edit_message` | Edit a previously sent message |
 | `react` | Add an emoji reaction |
-| `fetch_messages` | Fetch recent messages from a channel |
+| `fetch_messages` | Fetch recent messages from a channel (lists attachments per message) |
+| `download_attachment` | Save a message attachment to a local file and return its path |
+
+### File attachments
+
+Inbound messages with uploads carry an `attachments` attribute in the envelope
+(JSON: `id`, `name`, `size`, `mime_type` per file). Claude calls
+`download_attachment` with a file id; the file is saved under
+`<channels dir>/downloads/` with an id-prefixed, sanitized filename and the
+local path is returned — PDFs and images can then be read directly. Outbound,
+`reply` accepts a `files` array of local paths (max 5 per message).
+
+Both directions enforce a size cap (`MM_MAX_FILE_MB`, default 50). Downloads
+are gated by the same channel allowlist as every other tool, and attachment
+contents are flagged to the model as untrusted sender input.
 
 ## Environment Variables
 
@@ -102,6 +116,7 @@ The plugin reads from `~/.claude/channels/mattermost/.env` or from the MCP serve
 | `MM_BOT_TOKEN` | Yes | Bot personal access token |
 | `MM_BOT_USER_ID` | Yes | Bot user ID |
 | `MM_HEARTBEAT_INTERVAL` | No | WebSocket heartbeat interval in seconds (default: `0` = disabled) |
+| `MM_MAX_FILE_MB` | No | Attachment size cap in MB for download/upload (default: `50`) |
 
 ### Heartbeat (remote agents)
 
