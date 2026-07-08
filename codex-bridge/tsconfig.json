@@ -27,5 +27,5 @@
     "noUnusedParameters": false,
     "noPropertyAccessFromIndexSignature": false
   },
-  "include": ["*.ts", "../access-cli.ts"]
+  "include": ["*.ts", "../access-cli.ts", "../catchup.ts"]
 }

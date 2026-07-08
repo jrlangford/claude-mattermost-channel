@@ -5,9 +5,14 @@ standalone bot bridge. It uses `@openai/codex-sdk` to create or resume one
 Codex thread per Mattermost DM or group thread, then posts Codex's final
 response back to Mattermost.
 
-This directory is a self-contained package: its dependencies (including
-`@openai/codex-sdk`) are isolated from the Claude plugin at the repo root, so
-pure-Claude installs never pull the Codex SDK.
+This directory is a self-contained package in the dependency sense: its
+dependencies (including `@openai/codex-sdk`) are isolated from the Claude
+plugin at the repo root, so pure-Claude installs never pull the Codex SDK.
+
+> **Note:** the bridge does import two dependency-free modules from the repo
+> root (`../access-cli.ts` via the access CLI wrapper, and `../catchup.ts`
+> for catch-up post selection), so the `bin` entries are not
+> standalone-installable — run the bridge from a full checkout of this repo.
 
 ## Setup
 
@@ -67,13 +72,20 @@ Codex trust domains.
 
 ## Delivery semantics
 
-A channel is marked read (and the original post gets a 👀 reaction) only
-*after* Codex's response has been posted back to Mattermost. If the turn or
-the response post fails — or the process dies mid-turn — the channel stays
-unread and the unread catch-up on the next connect re-delivers the message
-(at-least-once; in-process dedup absorbs overlap). Catch-up enqueues turns
-per conversation without awaiting them, so one conversation's backlog never
-starves other channels.
+A channel is marked read (and the last answered post gets a 👀 reaction) only
+*after* Codex's response has been posted back to Mattermost **and** no other
+posts are pending in that channel — read receipts are channel-scoped in
+Mattermost, so a receipt for one turn must not consume messages still queued
+behind it. If a turn or its response post fails — or the process dies
+mid-backlog — the channel stays unread and the unread catch-up on the next
+connect re-delivers the outstanding messages (at-least-once; in-process dedup
+absorbs overlap, and a `create_at` cutoff keeps already-answered posts from
+being re-answered after a restart). Never-viewed channels are caught up with
+a capped 20-post tail so a first-time correspondent's message isn't lost.
+Catch-up enqueues turns per conversation without awaiting them, so one
+conversation's backlog never starves other channels. A turn that produces no
+final response posts a short notice rather than silently consuming the
+message.
 
 The bridge preserves the original DM pairing, allowlist, group opt-in,
 multi-bot, unread catch-up, and heartbeat behavior. It does not use Claude

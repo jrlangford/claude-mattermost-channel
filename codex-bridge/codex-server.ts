@@ -27,6 +27,7 @@ import {
 } from "fs";
 import { homedir } from "os";
 import { join } from "path";
+import { selectCatchUpPosts } from "../catchup.ts";
 
 process.on("unhandledRejection", (err) => {
   console.error("mattermost-codex: unhandled rejection:", err);
@@ -255,8 +256,10 @@ async function resolveBotForChannel(channelId: string): Promise<BotState> {
   if (multiBot) {
     // Unknown channel (e.g. an approval for a chat not seen since boot):
     // probe membership so the confirmation posts from the right bot rather
-    // than arbitrarily from the first one.
+    // than arbitrarily from the first one. Bots without a configured userId
+    // can't be probed (the members URL would be malformed) — skip them.
     for (const bot of bots.values()) {
+      if (!bot.config.userId) continue;
       try {
         const res = await mmApi(bot.config, `/channels/${channelId}/members/${bot.config.userId}`);
         if (res.ok) return bot;
@@ -687,13 +690,55 @@ async function markViewedWithRetry(bot: BotConfig, channelId: string): Promise<v
   }
 }
 
+// -- Channel-level read-receipt gating ---------------------------------------
+// mmViewChannel moves last_viewed_at for the WHOLE channel, so a receipt must
+// be gated on the channel's entire pending backlog, not on the single post
+// whose turn just finished: with multi-minute turns, later posts stack up
+// behind the running turn dedup'd only in memory, and marking the channel
+// read after turn N would make a crash lose posts N+1… permanently (catch-up
+// fetches since=last_viewed_at). Posts whose delivery failed additionally
+// hold the receipt until catch-up's redelivery of them succeeds.
+const channelPendingCounts = new Map<string, number>();
+const channelFailedPosts = new Map<string, Set<string>>();
+
+function channelSettled(channelId: string): boolean {
+  return (
+    (channelPendingCounts.get(channelId) ?? 0) === 0 &&
+    (channelFailedPosts.get(channelId)?.size ?? 0) === 0
+  );
+}
+
+function notePending(channelId: string): void {
+  channelPendingCounts.set(channelId, (channelPendingCounts.get(channelId) ?? 0) + 1);
+}
+
+function resolvePending(channelId: string, postId: string, delivered: boolean): void {
+  const count = (channelPendingCounts.get(channelId) ?? 1) - 1;
+  if (count <= 0) channelPendingCounts.delete(channelId);
+  else channelPendingCounts.set(channelId, count);
+
+  const failed = channelFailedPosts.get(channelId);
+  if (delivered) {
+    // A success for a previously-failed post is its redelivery landing.
+    if (failed?.delete(postId) && failed.size === 0) channelFailedPosts.delete(channelId);
+  } else if (failed) {
+    failed.add(postId);
+  } else {
+    channelFailedPosts.set(channelId, new Set([postId]));
+  }
+}
+
 // Mark-read is delivery-gated: it runs only after the turn's response has
-// actually been posted back to Mattermost. Marking a channel read makes the
-// post invisible to catch-up's since=last_viewed_at fetch, so doing it before
-// delivery turns a crash mid-turn into silent permanent loss (same fix as
-// server.ts 3a3c855). The 1.5s is read-receipt UX, not a delivery gate.
+// actually been posted back to Mattermost AND nothing else is pending in the
+// channel. Marking a channel read makes posts invisible to catch-up's
+// since=last_viewed_at fetch, so doing it early turns a crash mid-backlog
+// into silent permanent loss (same fix family as server.ts 3a3c855). The
+// 1.5s is read-receipt UX, not a delivery gate.
 function scheduleReadReceipt(state: BotState, post: MMPost): void {
   setTimeout(() => {
+    // Re-check at fire time: a post that arrived during the UX delay reopens
+    // the backlog, and ITS completion will schedule the receipt instead.
+    if (!channelSettled(post.channel_id)) return;
     void markViewedWithRetry(state.config, post.channel_id);
     mmReact(state.config, post.id, "eyes").catch(() => {});
   }, 1500);
@@ -708,6 +753,7 @@ function scheduleReadReceipt(state: BotState, post: MMPost): void {
 function enqueueCodexTurn(state: BotState, post: MMPost, isDM: boolean, username: string): void {
   const key = conversationKey(post.channel_id, isDM, post);
   const replyTo = isDM ? post.root_id : post.root_id || post.id;
+  notePending(post.channel_id);
   const prior = queues.get(key) ?? Promise.resolve();
   const next = prior
     .catch(() => {})
@@ -728,23 +774,27 @@ function enqueueCodexTurn(state: BotState, post: MMPost, isDM: boolean, username
       const turn = await thread.run(prompt);
       rememberThread(key, thread);
 
-      const response = turn.finalResponse.trim();
-      if (response) {
-        const sent = await mmPost(state.config, post.channel_id, response, replyTo);
-        if (sent.id) noteSent(state, sent.id);
-      } else {
-        console.error(`mattermost-codex: Codex produced no final response for ${post.id}`);
-      }
+      // An empty turn still posts a notice: consuming the message with no
+      // visible reply (and no redelivery) would be a silent swallow.
+      const response =
+        turn.finalResponse.trim() ||
+        "Codex completed this turn without producing a response.";
+      const sent = await mmPost(state.config, post.channel_id, response, replyTo);
+      if (sent.id) noteSent(state, sent.id);
 
-      // Only after the response is posted (or the turn completed with
-      // nothing to say): mark viewed + 👀.
-      scheduleReadReceipt(state, post);
+      // Only after the response is posted — and only if nothing else is
+      // pending in the channel — may the read receipt fire.
+      resolvePending(post.channel_id, post.id, true);
+      if (channelSettled(post.channel_id)) scheduleReadReceipt(state, post);
     })
     .catch(async (err) => {
       // Turn or response post failed: undo dedup and leave the channel
       // UNREAD so catch-up re-delivers (at-least-once; dedup absorbs
-      // overlap). The error notice must not mark the original read either.
+      // overlap). The failed post also blocks the channel's read receipt
+      // until its redelivery succeeds; the error notice must not mark the
+      // original read either.
       unmarkDelivered(post.id);
+      resolvePending(post.channel_id, post.id, false);
       const detail = err instanceof Error ? err.message : String(err);
       console.error(
         `mattermost-codex: Codex turn failed for ${post.id}; leaving channel unread for catch-up:`,
@@ -842,15 +892,25 @@ async function catchUpUnreads(state: BotState) {
       const unread = (await unreadRes.json()) as { msg_count: number };
       if (unread.msg_count <= 0) continue;
 
+      // Never-viewed channels (a brand-new DM from a first-time correspondent
+      // while the bridge was down) get a capped tail instead of a skip —
+      // skipping silently loses the first message a new user ever sends. The
+      // cap keeps a long pre-existing history from dumping. (Port of main's
+      // be8ed09.)
       const member = await mmGetChannelMember(config, channelId);
-      if (member.last_viewed_at <= 0) continue;
-
-      const postsRes = await mmApi(config, `/channels/${channelId}/posts?since=${member.last_viewed_at}`);
+      const neverViewed = member.last_viewed_at <= 0;
+      const postsRes = await mmApi(
+        config,
+        neverViewed
+          ? `/channels/${channelId}/posts?per_page=20`
+          : `/channels/${channelId}/posts?since=${member.last_viewed_at}`
+      );
       const data = (await postsRes.json()) as MMPostList;
-      const posts = (data.order ?? [])
-        .map((id) => data.posts[id]!)
-        .filter((p): p is MMPost => !!p && !!p.create_at)
-        .sort((a, b) => a.create_at - b.create_at);
+      // Cutoff on create_at: the since-fetch matches on update_at, so it also
+      // returns old posts our own 👀 reaction re-touched — without the cutoff
+      // every answered post is redelivered once the in-memory dedup dies with
+      // the process. (Port of main's 9055812; see ../catchup.ts.)
+      const posts = selectCatchUpPosts(data, neverViewed ? 0 : member.last_viewed_at);
 
       // processPost enqueues the Codex turn without awaiting it, so one
       // conversation's multi-minute backlog can't starve later channels.
