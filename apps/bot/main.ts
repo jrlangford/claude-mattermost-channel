@@ -156,9 +156,13 @@ function shutdown(): void {
 }
 process.on("SIGINT", shutdown);
 process.on("SIGTERM", shutdown);
-// In claude-channels mode the MCP host owns our stdio — treat its end as exit.
-process.stdin.on("end", shutdown);
-process.stdin.on("close", shutdown);
+// Only in claude-channels mode does the MCP host own our stdio — there,
+// stdin closing means the session is gone. Turn-mode daemons often run with
+// stdin at /dev/null (immediate EOF), which must NOT trigger shutdown.
+if (config.agent.mode === "claude-channels") {
+  process.stdin.on("end", shutdown);
+  process.stdin.on("close", shutdown);
+}
 
 console.error(
   `bot-app: starting ${config.agent.mode} × ${config.messaging.backend}` +

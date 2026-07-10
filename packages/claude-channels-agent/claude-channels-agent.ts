@@ -95,7 +95,13 @@ export const createClaudeChannelsAgent = defineAgent<ClaudeChannelsAgentConfig>(
 
   const mcp = new Server(
     { name: "claude-channels-agent", version: "0.1.0" },
-    { capabilities: { tools: {} }, instructions: INSTRUCTIONS }
+    {
+      // experimental["claude/channel"] is what makes Claude Code register the
+      // channel-notification listener — without it every notification is
+      // silently dropped even though the transport accepts it.
+      capabilities: { experimental: { "claude/channel": {} }, tools: {} },
+      instructions: INSTRUCTIONS,
+    }
   );
 
   mcp.setRequestHandler(ListToolsRequestSchema, async () => ({

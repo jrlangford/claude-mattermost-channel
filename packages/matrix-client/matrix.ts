@@ -474,7 +474,12 @@ export const createMatrixClient = defineMessagingClient<MatrixConfig>((config) =
           if (!raw) return; // empty room — nothing to mark
           latest = new MatrixEvent(raw as Partial<IEvent>);
         }
-        await client.sendReadReceipt(latest);
+        // Both the receipt AND the m.fully_read marker: receipts only reach
+        // a client through /sync, so a freshly restarted bot can't see its
+        // own receipt yet — the marker is room account data it can always
+        // read back (see getReadState), which is what keeps a restart from
+        // replaying already-answered history.
+        await client.setRoomReadMarkers(channelId, latest.getId()!, latest);
       });
     },
 
@@ -482,8 +487,37 @@ export const createMatrixClient = defineMessagingClient<MatrixConfig>((config) =
       return wrap("getReadState", async () => {
         const room = client.getRoom(channelId);
         const receipt = room?.getReadReceiptForUserId(config.userId);
+        let lastViewedAt = receipt?.data?.ts ?? 0;
+        if (lastViewedAt <= 0) {
+          // Fresh client: the receipt isn't in the sync store yet. Fall back
+          // to the m.fully_read marker (store first, then REST) and use the
+          // marked event's server timestamp as the read cutoff.
+          let markerEventId = (
+            room?.getAccountData("m.fully_read" as never)?.getContent() as
+              | { event_id?: string }
+              | undefined
+          )?.event_id;
+          if (!markerEventId) {
+            const res = await fetch(
+              `${config.baseUrl.replace(/\/+$/, "")}/_matrix/client/v3/user/${encodeURIComponent(
+                config.userId
+              )}/rooms/${encodeURIComponent(channelId)}/account_data/m.fully_read`,
+              { headers: { Authorization: `Bearer ${config.accessToken}` } }
+            );
+            if (res.ok) {
+              markerEventId = ((await res.json()) as { event_id?: string }).event_id;
+            }
+          }
+          if (markerEventId) {
+            try {
+              lastViewedAt = (await fetchRaw(channelId, markerEventId)).origin_server_ts ?? 0;
+            } catch {
+              // marker points at an event we can't fetch — treat as unread
+            }
+          }
+        }
         return {
-          lastViewedAt: receipt?.data?.ts ?? 0,
+          lastViewedAt,
           unreadCount: room?.getUnreadNotificationCount(NotificationCountType.Total),
         };
       });

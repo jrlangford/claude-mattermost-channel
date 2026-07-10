@@ -99,6 +99,16 @@ describe("createClaudeChannelsAgent", () => {
     expect(h.notifications[0].params.meta.chat_id).toBe("c1");
   });
 
+  test("declares the claude/channel capability (host drops notifications without it)", async () => {
+    // Regression: the port once shipped with only {tools: {}} — Claude Code
+    // then accepted every notification on the transport but never surfaced
+    // one, because the channel listener registers off this capability.
+    const h = await harness();
+    const caps = h.mcpClient.getServerCapabilities();
+    expect(caps?.experimental?.["claude/channel"]).toEqual({});
+    expect(caps?.tools).toBeDefined();
+  });
+
   test("send() before start() throws", async () => {
     const { client } = fakeMessagingClient();
     const agent = createClaudeChannelsAgent({

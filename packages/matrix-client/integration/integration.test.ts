@@ -310,6 +310,27 @@ describe.skipIf(!MX_IT_URL)("matrix-client integration", () => {
     expect(new TextDecoder().decode(bytes)).toBe("hello matrix attachment");
   }, LONG);
 
+  test("read state survives a fresh client (bot restart scenario)", async () => {
+    const s = await setup();
+    await s.client.markRead(s.ctx.dmRoomId);
+
+    // A brand-new client on the same account — the sync store starts empty,
+    // exactly like a bot restart. Without a marker fallback this reads 0 and
+    // a restarting bot replays already-answered history into a fresh agent.
+    const fresh = createMatrixClient({
+      baseUrl: s.ctx.url,
+      accessToken: s.ctx.botToken,
+      userId: s.ctx.botUserId,
+    });
+    await fresh.connect();
+    try {
+      const state = await fresh.getReadState(s.ctx.dmRoomId);
+      expect(state.lastViewedAt).toBeGreaterThan(0);
+    } finally {
+      await fresh.disconnect();
+    }
+  }, LONG);
+
   test("error mapping: bad token → forbidden, missing event → not_found", async () => {
     const s = await setup();
     const badClient = createMatrixClient({
