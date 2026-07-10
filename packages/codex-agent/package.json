@@ -1,0 +1,22 @@
+{
+  "name": "codex-agent",
+  "version": "0.0.0",
+  "license": "Apache-2.0",
+  "type": "module",
+  "private": true,
+  "exports": {
+    ".": "./index.ts"
+  },
+  "scripts": {
+    "test": "bun test",
+    "check": "bun build ./index.ts --target=bun --outfile=/tmp/codex-agent-check.js && rm -f /tmp/codex-agent-check.js"
+  },
+  "dependencies": {
+    "@openai/codex-sdk": "^0.142.4",
+    "agent": "workspace:*"
+  },
+  "devDependencies": {
+    "@types/node": "^26.0.1",
+    "bun-types": "^1.3.14"
+  }
+}

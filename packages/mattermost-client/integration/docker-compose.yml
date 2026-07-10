@@ -1,0 +1,59 @@
+# Integration-test stack for mattermost-client: a real Mattermost (team
+# edition) on Postgres, plus a bun container that runs the tests on the
+# compose network — so the host needs docker only, no bun install.
+#
+# Ephemeral by design: postgres data on tmpfs, no named volumes; run.sh does
+# `down -v` around each run. Host port (default 18065) is only published for
+# debugging/local runs — the tests talk to http://mattermost:8065 internally.
+
+services:
+  postgres:
+    image: postgres:15-alpine
+    environment:
+      POSTGRES_USER: mmuser
+      POSTGRES_PASSWORD: mmpass
+      POSTGRES_DB: mattermost
+    tmpfs:
+      - /var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U mmuser -d mattermost"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  mattermost:
+    image: mattermost/mattermost-team-edition:latest
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      MM_SQLSETTINGS_DRIVERNAME: postgres
+      MM_SQLSETTINGS_DATASOURCE: postgres://mmuser:mmpass@postgres:5432/mattermost?sslmode=disable&connect_timeout=10
+      MM_SERVICESETTINGS_SITEURL: http://mattermost:8065
+      # The two admin toggles the plugin README tells real admins to enable.
+      MM_SERVICESETTINGS_ENABLEBOTACCOUNTCREATION: "true"
+      MM_SERVICESETTINGS_ENABLEUSERACCESSTOKENS: "true"
+      MM_TEAMSETTINGS_ENABLEOPENSERVER: "true"
+      MM_PLUGINSETTINGS_ENABLE: "false"
+      MM_LOGSETTINGS_CONSOLELEVEL: "ERROR"
+    ports:
+      - "${MM_IT_PORT:-18065}:8065"
+    # No container healthcheck: the mattermost image is distroless (no shell,
+    # no curl), so exec-based checks can't run. Readiness is owned by the
+    # test bootstrap's waitForServer(), which polls /system/ping over HTTP.
+
+  tests:
+    image: oven/bun:1
+    profiles: ["test"] # never started by `up` — only via `compose run tests`
+    depends_on:
+      mattermost:
+        condition: service_started
+    working_dir: /repo
+    environment:
+      MM_IT_URL: http://mattermost:8065
+      BUN_INSTALL_CACHE_DIR: /tmp/bun-cache
+    volumes:
+      - ../../..:/repo
+    command: >
+      sh -c "bun install --no-summary &&
+             bun test packages/mattermost-client/integration/integration.test.ts --timeout 120000"

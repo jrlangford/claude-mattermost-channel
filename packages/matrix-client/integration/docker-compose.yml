@@ -1,0 +1,63 @@
+# Integration-test stack for matrix-client: a real Synapse homeserver plus a
+# bun container that runs the tests on the compose network — host needs
+# docker only.
+#
+# Synapse generates its own config + signing key at container start (into a
+# tmpfs /data, so every run is a fresh server), then test-friendly settings
+# are appended: open registration without verification, and rate limits
+# effectively disabled — Synapse's defaults (~0.2 msg/s) would 429 the test
+# suite immediately. SQLite is plenty for a throwaway server; no postgres.
+
+services:
+  synapse:
+    image: matrixdotorg/synapse:latest
+    environment:
+      SYNAPSE_SERVER_NAME: it.local
+      SYNAPSE_REPORT_STATS: "no"
+    tmpfs:
+      - /data
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        python /start.py generate
+        cat >> /data/homeserver.yaml <<'EOF'
+
+        # -- appended for integration tests --
+        enable_registration: true
+        enable_registration_without_verification: true
+        presence:
+          enabled: false
+        rc_message: {per_second: 1000, burst_count: 10000}
+        rc_registration: {per_second: 1000, burst_count: 10000}
+        rc_login:
+          address: {per_second: 1000, burst_count: 10000}
+          account: {per_second: 1000, burst_count: 10000}
+          failed_attempts: {per_second: 1000, burst_count: 10000}
+        rc_joins:
+          local: {per_second: 1000, burst_count: 10000}
+          remote: {per_second: 1000, burst_count: 10000}
+        rc_invites:
+          per_room: {per_second: 1000, burst_count: 10000}
+          per_user: {per_second: 1000, burst_count: 10000}
+        EOF
+        exec python /start.py
+    ports:
+      - "${MX_IT_PORT:-18008}:8008"
+    # No container healthcheck (consistent with the mattermost harness):
+    # readiness is owned by the test bootstrap polling /health over HTTP.
+
+  tests:
+    image: oven/bun:1
+    profiles: ["test"] # never started by `up` — only via `compose run tests`
+    depends_on:
+      synapse:
+        condition: service_started
+    working_dir: /repo
+    environment:
+      MX_IT_URL: http://synapse:8008
+      BUN_INSTALL_CACHE_DIR: /tmp/bun-cache
+    volumes:
+      - ../../..:/repo
+    command: >
+      sh -c "bun install --no-summary &&
+             bun test packages/matrix-client/integration/integration.test.ts --timeout 120000"
