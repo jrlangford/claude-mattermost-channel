@@ -40,37 +40,53 @@ export async function waitForServer(url: string, timeoutMs = 240_000): Promise<v
   const deadline = Date.now() + timeoutMs;
   let lastErr: unknown = null;
   while (Date.now() < deadline) {
-    try {
-      const res = await fetch(`${url}/health`);
-      if (res.ok) return;
-      lastErr = new Error(`health ${res.status}`);
-    } catch (err) {
-      lastErr = err;
+    // /health is Synapse-specific; /_matrix/client/versions is spec-mandated
+    // (conduwuit-family servers have no /health).
+    for (const probe of ["/health", "/_matrix/client/versions"]) {
+      try {
+        const res = await fetch(`${url}${probe}`);
+        if (res.ok) return;
+        lastErr = new Error(`${probe} ${res.status}`);
+      } catch (err) {
+        lastErr = err;
+      }
     }
     await new Promise((r) => setTimeout(r, 2000));
   }
-  throw new Error(`bootstrap: synapse not ready after ${timeoutMs}ms: ${lastErr}`);
+  throw new Error(`bootstrap: homeserver not ready after ${timeoutMs}ms: ${lastErr}`);
 }
 
-/** Register (dummy auth), falling back to login when the user exists. */
+/** Register (UIA-aware), falling back to login when the user exists. */
 async function registerOrLogin(
   url: string,
-  username: string
+  username: string,
+  registrationToken?: string
 ): Promise<{ userId: string; token: string }> {
+  // Bare request first: the server answers 401 with the UIA flows it
+  // accepts. Synapse (open registration) offers m.login.dummy; the
+  // conduwuit family offers m.login.registration_token.
   let res = await api(url, "/v3/register", {
     method: "POST",
-    body: JSON.stringify({ username, password: PW, auth: { type: "m.login.dummy" } }),
+    body: JSON.stringify({ username, password: PW }),
   });
   if (res.status === 401) {
-    // UIA session dance: retry the dummy stage with the offered session.
-    const flows = (await res.json()) as { session?: string };
+    const uia = (await res.json()) as { session?: string; flows?: { stages: string[] }[] };
+    const stages = uia.flows?.flatMap((f) => f.stages) ?? [];
+    const auth =
+      registrationToken && stages.includes("m.login.registration_token")
+        ? { type: "m.login.registration_token", token: registrationToken, session: uia.session }
+        : stages.includes("m.login.dummy")
+          ? { type: "m.login.dummy", session: uia.session }
+          : null;
+    if (!auth) {
+      throw new Error(
+        `bootstrap: no supported registration flow (server offers: ${stages.join(", ") || "none"}; ` +
+          `set MX_IT_REG_TOKEN for token-gated servers)`
+      );
+    }
     res = await api(url, "/v3/register", {
       method: "POST",
-      body: JSON.stringify({
-        username,
-        password: PW,
-        auth: { type: "m.login.dummy", session: flows.session },
-      }),
+      body: JSON.stringify({ username, password: PW, auth }),
     });
   }
   if (res.ok) {
@@ -95,11 +111,15 @@ async function registerOrLogin(
   return { userId: login.user_id, token: login.access_token };
 }
 
-export async function bootstrap(url: string): Promise<ITContext> {
+export async function bootstrap(
+  url: string,
+  opts: { registrationToken?: string } = {}
+): Promise<ITContext> {
   await waitForServer(url);
 
-  const bot = await registerOrLogin(url, "itbot");
-  const human = await registerOrLogin(url, "ithuman");
+  const registrationToken = opts.registrationToken ?? process.env.MX_IT_REG_TOKEN;
+  const bot = await registerOrLogin(url, "itbot", registrationToken);
+  const human = await registerOrLogin(url, "ithuman", registrationToken);
 
   // DM room: human creates + invites the bot, bot joins. is_direct makes
   // clients (and our adapter, via m.direct below) treat it as a DM.
