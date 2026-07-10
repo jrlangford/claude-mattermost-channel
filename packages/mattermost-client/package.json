@@ -1,0 +1,23 @@
+{
+  "name": "mattermost-client",
+  "version": "0.0.0",
+  "license": "Apache-2.0",
+  "type": "module",
+  "private": true,
+  "exports": {
+    ".": "./index.ts"
+  },
+  "scripts": {
+    "test": "bun test",
+    "test:integration": "bash integration/run.sh",
+    "check": "bun build ./index.ts --target=bun --outfile=/tmp/mattermost-client-check.js && rm -f /tmp/mattermost-client-check.js"
+  },
+  "dependencies": {
+    "mattermost-shared": "workspace:*",
+    "messaging-client": "workspace:*"
+  },
+  "devDependencies": {
+    "@types/node": "^26.0.1",
+    "bun-types": "^1.3.14"
+  }
+}

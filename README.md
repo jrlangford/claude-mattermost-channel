@@ -16,6 +16,10 @@ apps/
 packages/
   mattermost-shared/           Shared, dependency-free modules (catch-up post
                                selection, attachment helpers, access-control CLI)
+  messaging-client/            Backend-neutral messaging contract (types +
+                               MessagingClient interface)
+  mattermost-client/           Mattermost adapter implementing messaging-client
+  agent/                       Agent/orchestration layer (scaffold)
 ```
 
 Each app owns its runtime dependency — `@modelcontextprotocol/sdk` for the
