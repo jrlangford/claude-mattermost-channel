@@ -19,7 +19,8 @@
     "codex-agent": "workspace:*",
     "matrix-client": "workspace:*",
     "mattermost-client": "workspace:*",
-    "messaging-client": "workspace:*"
+    "messaging-client": "workspace:*",
+    "zulip-client": "workspace:*"
   },
   "devDependencies": {
     "@rmux/sdk": "^0.6.5",

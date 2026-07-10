@@ -1,0 +1,126 @@
+# Integration-test stack for zulip-client: a real Zulip server (which needs
+# postgres + memcached + rabbitmq + redis) plus a bun container that runs the
+# tests on the compose network — the host needs docker only.
+#
+# Adapted from zulip/docker-zulip's compose.yaml with docker secrets replaced
+# by fixed test-only passwords (the entrypoint accepts SECRETS_* env vars),
+# tmpfs data (ephemeral by design; run.sh does `down -v` around each run),
+# and HTTP only (no CERTIFICATES set → the container serves plain HTTP :80).
+#
+# Realm/user seeding can't happen over REST (Zulip has no open registration
+# API); run.sh pipes seed.py through `manage.py shell` before the tests run.
+
+services:
+  database:
+    image: "zulip/zulip-postgresql:14"
+    environment:
+      POSTGRES_DB: zulip
+      POSTGRES_USER: zulip
+      POSTGRES_PASSWORD: zuliptestpass
+    tmpfs:
+      - /var/lib/postgresql/data
+
+  memcached:
+    image: "memcached:alpine"
+    command:
+      - "sh"
+      - "-euc"
+      - |
+        echo 'mech_list: plain' > "$$SASL_CONF_PATH"
+        echo "zulip@$$HOSTNAME:zuliptestpass" > "$$MEMCACHED_SASL_PWDB"
+        echo "zulip@localhost:zuliptestpass" >> "$$MEMCACHED_SASL_PWDB"
+        exec memcached -S
+    environment:
+      SASL_CONF_PATH: "/home/memcache/memcached.conf"
+      MEMCACHED_SASL_PWDB: "/home/memcache/memcached-sasl-db"
+
+  rabbitmq:
+    image: "rabbitmq:4.2"
+    environment:
+      RABBITMQ_DEFAULT_USER: zulip
+      RABBITMQ_DEFAULT_PASS: zuliptestpass
+
+  redis:
+    image: "redis:alpine"
+    command: ["redis-server", "--requirepass", "zuliptestpass"]
+
+  zulip:
+    image: "ghcr.io/zulip/zulip-server:12.1-0"
+    depends_on:
+      - database
+      - memcached
+      - rabbitmq
+      - redis
+    environment:
+      SETTING_REMOTE_POSTGRES_HOST: "database"
+      SETTING_MEMCACHED_LOCATION: "memcached:11211"
+      SETTING_RABBITMQ_HOST: "rabbitmq"
+      SETTING_REDIS_HOST: "redis"
+      SECRETS_postgres_password: "zuliptestpass"
+      SECRETS_memcached_password: "zuliptestpass"
+      SECRETS_rabbitmq_password: "zuliptestpass"
+      SECRETS_redis_password: "zuliptestpass"
+      SECRETS_secret_key: "it-only-not-a-real-deployment-secret-0000"
+      # EXTERNAL_HOST needs a domain part (zulip.E002) but is never matched
+      # by our clients: any non-matching Host header (http://zulip in-network,
+      # localhost:<port>, gateway IPs) routes to the root-domain realm that
+      # seed.py creates. ALLOWED_HOSTS * lets those hosts through Django.
+      SETTING_EXTERNAL_HOST: "zulip.e2e.local"
+      SETTING_ZULIP_ADMINISTRATOR: "admin@e2e.local"
+      SETTING_ALLOWED_HOSTS: '["*"]'
+      # The API rate limiter would throttle a fast test suite.
+      SETTING_RATE_LIMITING: "False"
+      # Zulip refuses plain HTTP unless it arrives via a trusted proxy that
+      # sets X-Forwarded-Proto (DetectProxyMisconfiguration). The `proxy`
+      # service below is that proxy; trusting the world is fine in an
+      # ephemeral test network that isn't reachable from anywhere real.
+      LOADBALANCER_IPS: "0.0.0.0/0"
+    tmpfs:
+      - /data
+
+  # TLS-termination stand-in: forwards plain HTTP but supplies the proxy
+  # headers Zulip's misconfiguration check demands. All clients (tests, the
+  # published host port, E2E bots) go through here, never to zulip directly.
+  proxy:
+    image: nginx:alpine
+    depends_on:
+      - zulip
+    ports:
+      - "${ZULIP_IT_PORT:-18011}:80"
+    command:
+      - "sh"
+      - "-euc"
+      - |
+        cat > /etc/nginx/conf.d/default.conf <<'CONF'
+        server {
+          listen 80;
+          client_max_body_size 50m;
+          location / {
+            proxy_pass http://zulip:80;
+            proxy_set_header Host $$http_host;
+            proxy_set_header X-Forwarded-For $$remote_addr;
+            proxy_set_header X-Forwarded-Proto http;
+            proxy_http_version 1.1;
+            proxy_buffering off;
+            # Zulip long-polls GET /events for up to ~90s.
+            proxy_read_timeout 150s;
+          }
+        }
+        CONF
+        exec nginx -g 'daemon off;'
+
+  tests:
+    image: oven/bun:1
+    profiles: ["test"] # never started by `up` — only via `compose run tests`
+    depends_on:
+      proxy:
+        condition: service_started
+    working_dir: /repo
+    environment:
+      ZULIP_IT_URL: http://proxy
+      BUN_INSTALL_CACHE_DIR: /tmp/bun-cache
+    volumes:
+      - ../../..:/repo
+    command: >
+      sh -c "bun install --no-summary &&
+             bun test packages/zulip-client/integration/integration.test.ts --timeout 120000"

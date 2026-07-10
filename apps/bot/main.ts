@@ -20,10 +20,12 @@ import { createCodexAgent } from "codex-agent";
 import { createMatrixClient } from "matrix-client";
 import { createMattermostClient } from "mattermost-client";
 import type { MessagingClient } from "messaging-client";
+import { createZulipClient } from "zulip-client";
 
 type MessagingConfig =
   | { backend: "mattermost"; url: string; token: string; heartbeatIntervalMs?: number }
-  | { backend: "matrix"; baseUrl: string; accessToken: string; userId: string; deviceId?: string };
+  | { backend: "matrix"; baseUrl: string; accessToken: string; userId: string; deviceId?: string }
+  | { backend: "zulip"; url: string; email: string; apiKey: string };
 
 type AgentConfig =
   | {
@@ -87,6 +89,15 @@ function buildClient(config: MessagingConfig): MessagingClient {
         accessToken: config.accessToken,
         userId: config.userId,
         deviceId: config.deviceId,
+      });
+    case "zulip":
+      if (!config.url || !config.email || !config.apiKey) {
+        fatal("zulip backend needs url + email + apiKey");
+      }
+      return createZulipClient({
+        url: config.url,
+        email: config.email,
+        apiKey: config.apiKey,
       });
     default:
       fatal(`unknown messaging backend: ${(config as { backend: string }).backend}`);
