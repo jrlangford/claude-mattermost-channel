@@ -8,10 +8,12 @@
     "codex-mattermost-access": "./codex-access-cli.ts"
   },
   "scripts": {
-    "start": "bun install --no-summary && bun codex-server.ts"
+    "start": "bun install --no-summary && bun codex-server.ts",
+    "check": "bun build ./codex-server.ts --target=bun --outfile=/tmp/codex-check.js && rm -f /tmp/codex-check.js"
   },
   "dependencies": {
-    "@openai/codex-sdk": "^0.142.4"
+    "@openai/codex-sdk": "^0.142.4",
+    "mattermost-shared": "workspace:*"
   },
   "devDependencies": {
     "@types/node": "^26.0.1",

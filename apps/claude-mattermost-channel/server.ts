@@ -28,8 +28,12 @@ import {
 import { statSync } from "fs";
 import { join, basename } from "path";
 import { homedir } from "os";
-import { selectCatchUpPosts } from "./catchup.ts";
-import { describeAttachments, sanitizeFilename, type MMFileInfo } from "./files.ts";
+import {
+  selectCatchUpPosts,
+  describeAttachments,
+  sanitizeFilename,
+  type MMFileInfo,
+} from "mattermost-shared";
 
 // -- Crash handlers — log and keep serving instead of dying silently --
 process.on("unhandledRejection", (err) => {

@@ -5,15 +5,16 @@ standalone bot bridge. It uses `@openai/codex-sdk` to create or resume one
 Codex thread per Mattermost DM or group thread, then posts Codex's final
 response back to Mattermost.
 
-This directory is a self-contained package in the dependency sense: its
+This app is a self-contained package in the dependency sense: its
 dependencies (including `@openai/codex-sdk`) are isolated from the Claude
-plugin at the repo root, so pure-Claude installs never pull the Codex SDK.
+plugin, so pure-Claude installs never pull the Codex SDK.
 
-> **Note:** the bridge does import a few dependency-free modules from the
-> repo root (`../access-cli.ts` via the access CLI wrapper, `../catchup.ts`
-> for catch-up post selection, and `../files.ts` for attachment handling),
-> so the `bin` entries are not standalone-installable — run the bridge from
-> a full checkout of this repo.
+> **Note:** the bridge imports a few dependency-free modules from the
+> `mattermost-shared` workspace package (the access CLI via
+> `mattermost-shared/access-cli`, `selectCatchUpPosts` for catch-up post
+> selection, and the attachment helpers), so the `bin` entries are not
+> standalone-installable — run the bridge from a full checkout of this
+> monorepo after `bun install` at the root.
 
 ## Setup
 
@@ -50,10 +51,10 @@ bun codex-access-cli.ts pair <code>
 bun codex-access-cli.ts policy allowlist
 ```
 
-The CLI is a thin wrapper around the Claude bridge's `access-cli.ts`, pointed
-at the Codex state directory via `MATTERMOST_ACCESS_HOME` — a CLI-only
-override that neither server reads, so it can never cross the Claude and
-Codex trust domains.
+The CLI is a thin wrapper around the shared `access-cli` (from the
+`mattermost-shared` package), pointed at the Codex state directory via
+`MATTERMOST_ACCESS_HOME` — a CLI-only override that neither server reads, so
+it can never cross the Claude and Codex trust domains.
 
 ## Environment variables
 

@@ -2,5 +2,11 @@
 node_modules/
 bun.lock
 
+# Turbo
+.turbo/
+
 # Auto-generated
 CLAUDE.md
+
+# macOS
+.DS_Store

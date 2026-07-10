@@ -27,13 +27,13 @@ import {
 } from "fs";
 import { homedir } from "os";
 import { join } from "path";
-import { selectCatchUpPosts } from "../catchup.ts";
 import {
+  selectCatchUpPosts,
   describeAttachments,
   sanitizeFilename,
   type AttachmentSummary,
   type MMFileInfo,
-} from "../files.ts";
+} from "mattermost-shared";
 
 process.on("unhandledRejection", (err) => {
   console.error("mattermost-codex: unhandled rejection:", err);
@@ -908,8 +908,8 @@ async function processPost(state: BotState, post: MMPost) {
 
   if (result.action === "pair") {
     const pairMsg = result.isResend
-      ? `Pairing required - run in this repository:\n\n\`bun codex-bridge/codex-access-cli.ts pair ${result.code}\``
-      : `Hi! I need to verify your identity before we can chat.\n\nRun this in this repository:\n\n\`bun codex-bridge/codex-access-cli.ts pair ${result.code}\``;
+      ? `Pairing required - run in this repository:\n\n\`bun apps/codex-mattermost-bridge/codex-access-cli.ts pair ${result.code}\``
+      : `Hi! I need to verify your identity before we can chat.\n\nRun this in this repository:\n\n\`bun apps/codex-mattermost-bridge/codex-access-cli.ts pair ${result.code}\``;
     await mmPost(config, channelId, pairMsg);
     return;
   }
@@ -988,7 +988,7 @@ async function catchUpUnreads(state: BotState) {
       // Cutoff on create_at: the since-fetch matches on update_at, so it also
       // returns old posts our own 👀 reaction re-touched — without the cutoff
       // every answered post is redelivered once the in-memory dedup dies with
-      // the process. (Port of main's 9055812; see ../catchup.ts.)
+      // the process. (Port of main's 9055812; see mattermost-shared/catchup.ts.)
       const posts = selectCatchUpPosts(data, neverViewed ? 0 : member.last_viewed_at);
 
       // processPost enqueues the Codex turn without awaiting it, so one
