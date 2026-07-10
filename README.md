@@ -19,6 +19,8 @@ packages/
   messaging-client/            Backend-neutral messaging contract (types +
                                MessagingClient interface)
   mattermost-client/           Mattermost adapter implementing messaging-client
+  matrix-client/               Matrix adapter implementing messaging-client
+                               (matrix-js-sdk)
   agent/                       Agent/orchestration layer (scaffold)
 ```
 
