@@ -1,5 +1,5 @@
 {
-  "name": "agent",
+  "name": "bot",
   "version": "0.0.0",
   "license": "Apache-2.0",
   "type": "module",
@@ -9,7 +9,12 @@
   },
   "scripts": {
     "test": "bun test",
-    "check": "bun build ./index.ts --target=bun --outfile=/tmp/agent-check.js && rm -f /tmp/agent-check.js"
+    "check": "bun build ./index.ts --target=bun --outfile=/tmp/bot-check.js && rm -f /tmp/bot-check.js"
+  },
+  "dependencies": {
+    "agent": "workspace:*",
+    "mattermost-shared": "workspace:*",
+    "messaging-client": "workspace:*"
   },
   "devDependencies": {
     "@types/node": "^26.0.1",

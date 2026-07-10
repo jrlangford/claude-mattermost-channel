@@ -11,17 +11,24 @@ modules.
 
 ```
 apps/
-  claude-mattermost-channel/   Claude Code channel plugin (MCP bridge, access CLI, skills)
-  codex-mattermost-bridge/     Standalone Codex SDK bot bridge
-packages/
-  mattermost-shared/           Shared, dependency-free modules (catch-up post
-                               selection, attachment helpers, access-control CLI)
-  messaging-client/            Backend-neutral messaging contract (types +
-                               MessagingClient interface)
-  mattermost-client/           Mattermost adapter implementing messaging-client
-  matrix-client/               Matrix adapter implementing messaging-client
-                               (matrix-js-sdk)
-  agent/                       Agent/orchestration layer (scaffold)
+  bot/                         THE bot: polymorphic composition — pick a
+                               messaging backend + an agent mode in config
+  claude-mattermost-channel/   (legacy) hand-written Claude channel plugin
+  codex-mattermost-bridge/     (legacy) hand-written Codex bridge
+
+packages/                      the lego pieces
+  messaging-client/            contract: "how to talk to a chat network"
+  mattermost-client/             impl: Mattermost (REST + WS)
+  matrix-client/                 impl: Matrix (matrix-js-sdk)
+  agent/                       contract: "something you can converse with"
+  codex-agent/                   impl: turn-based on @openai/codex-sdk
+  claude-code-sdk-agent/         impl: turn-based on the Claude Agent SDK
+  claude-channels-agent/         impl: session mode (MCP notifications into
+                                 a live Claude Code session; replies via tools)
+  bot/                         the write-once bot core: gate/pairing, dedup,
+                               catch-up, per-conversation queues,
+                               delivery-gated read receipts
+  mattermost-shared/           legacy shared modules + the access CLI
 ```
 
 Each app owns its runtime dependency — `@modelcontextprotocol/sdk` for the

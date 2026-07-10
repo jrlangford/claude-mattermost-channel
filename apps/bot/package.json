@@ -1,0 +1,28 @@
+{
+  "name": "bot-app",
+  "version": "0.0.1",
+  "license": "Apache-2.0",
+  "type": "module",
+  "private": true,
+  "bin": {
+    "channel-bot": "./main.ts"
+  },
+  "scripts": {
+    "start": "bun main.ts",
+    "check": "bun build ./main.ts --target=bun --outfile=/tmp/bot-app-check.js && rm -f /tmp/bot-app-check.js"
+  },
+  "dependencies": {
+    "agent": "workspace:*",
+    "bot": "workspace:*",
+    "claude-channels-agent": "workspace:*",
+    "claude-code-sdk-agent": "workspace:*",
+    "codex-agent": "workspace:*",
+    "matrix-client": "workspace:*",
+    "mattermost-client": "workspace:*",
+    "messaging-client": "workspace:*"
+  },
+  "devDependencies": {
+    "@types/node": "^26.0.1",
+    "bun-types": "^1.3.14"
+  }
+}

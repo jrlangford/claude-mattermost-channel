@@ -1,0 +1,17 @@
+{
+  "stateDir": "~/.channel-bot",
+  "botName": "amelia",
+  "messaging": {
+    "backend": "mattermost",
+    "url": "https://mattermost.example.com",
+    "token": "<bot personal access token>",
+    "heartbeatIntervalMs": 30000
+  },
+  "agent": {
+    "mode": "codex",
+    "threadOptions": {
+      "sandboxMode": "workspace-write",
+      "workingDirectory": "/path/to/workspace"
+    }
+  }
+}
