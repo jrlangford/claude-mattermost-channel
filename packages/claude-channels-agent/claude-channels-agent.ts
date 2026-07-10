@@ -28,8 +28,7 @@ import {
 } from "@modelcontextprotocol/sdk/types.js";
 import type { Transport } from "@modelcontextprotocol/sdk/shared/transport.js";
 import { defineAgent, type AgentInput } from "agent";
-import { sanitizeFilename } from "mattermost-shared";
-import type { MessagingClient } from "messaging-client";
+import { sanitizeFilename, type MessagingClient } from "messaging-client";
 
 export type ClaudeChannelsAgentConfig = {
   /** The transport the session's tools act on. */

@@ -1,10 +1,12 @@
 // Matrix wire format → messaging-client domain types. Pure functions,
 // unit-tested in convert.test.ts; all network I/O lives in matrix.ts.
 
-// The sanitizer is generic (hostile remote filenames) despite living in
-// mattermost-shared — see that package; a neutral home can come later.
-import { sanitizeFilename } from "mattermost-shared";
-import type { Attachment, ChannelKind, Message } from "messaging-client";
+import {
+  sanitizeFilename,
+  type Attachment,
+  type ChannelKind,
+  type Message,
+} from "messaging-client";
 
 // -- Matrix wire types (the fields we consume) --
 

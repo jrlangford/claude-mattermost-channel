@@ -13,7 +13,6 @@
     "check": "bun build ./index.ts --target=bun --outfile=/tmp/mattermost-client-check.js && rm -f /tmp/mattermost-client-check.js"
   },
   "dependencies": {
-    "mattermost-shared": "workspace:*",
     "messaging-client": "workspace:*"
   },
   "devDependencies": {

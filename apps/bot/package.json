@@ -8,7 +8,7 @@
     "channel-bot": "./main.ts"
   },
   "scripts": {
-    "start": "bun main.ts",
+    "start": "bun install --no-summary && bun main.ts",
     "check": "bun build ./main.ts --target=bun --outfile=/tmp/bot-app-check.js && rm -f /tmp/bot-app-check.js"
   },
   "dependencies": {

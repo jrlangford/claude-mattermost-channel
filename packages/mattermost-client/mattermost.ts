@@ -24,9 +24,9 @@ import {
   type User,
   type UserId,
 } from "messaging-client";
-import type { MMFileInfo } from "mattermost-shared";
 import {
   attachmentFromMM,
+  type MMFileInfo,
   channelFromMM,
   flattenPostList,
   postToMessage,

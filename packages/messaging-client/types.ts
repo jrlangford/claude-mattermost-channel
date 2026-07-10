@@ -79,8 +79,8 @@ export type ChannelReadState = {
   /**
    * When the bot last marked this channel read, ms since epoch. <= 0 means
    * never viewed. Note Mattermost's since-fetch matches on update_at, not
-   * create_at — catch-up consumers should apply their own create-time cutoff
-   * (see mattermost-shared's selectCatchUpPosts).
+   * create_at — catch-up consumers must apply their own create-time cutoff
+   * (the bot core does).
    */
   lastViewedAt: number;
   /** Unread message count, when the backend can report it cheaply. */

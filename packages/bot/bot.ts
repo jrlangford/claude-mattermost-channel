@@ -19,8 +19,7 @@
 import { existsSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from "fs";
 import { join } from "path";
 import type { Agent, AgentFile } from "agent";
-import { sanitizeFilename } from "mattermost-shared";
-import type { Message, MessagingClient, User } from "messaging-client";
+import { sanitizeFilename, type Message, type MessagingClient, type User } from "messaging-client";
 import {
   createOutboundGuard,
   gate,

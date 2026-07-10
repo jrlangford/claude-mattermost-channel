@@ -31,7 +31,7 @@ await client.sendMessage(channelId, { text: "hello", threadId });
 - **Mentions** are surfaced from the `posted` broadcast's structured
   `mentions` field (no text matching).
 - **Attachment names are sanitized** at the boundary (via
-  `mattermost-shared`) — filenames are remote-user input.
+  `messaging-client`'s `sanitizeFilename`) — filenames are remote-user input.
 - **`listChannels()`** flattens teams and dedupes (DMs appear under every
   team).
 - **Errors** are normalized to `MessagingClientError` — HTTP status →

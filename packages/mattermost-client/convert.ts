@@ -1,10 +1,56 @@
 // Mattermost wire format → messaging-client domain types. Pure functions,
 // unit-tested in convert.test.ts; all network I/O lives in mattermost.ts.
 
-import { describeAttachments, sanitizeFilename, type MMFileInfo } from "mattermost-shared";
-import type { Attachment, Channel, ChannelKind, Message, User } from "messaging-client";
+import {
+  sanitizeFilename,
+  type Attachment,
+  type Channel,
+  type ChannelKind,
+  type Message,
+  type User,
+} from "messaging-client";
 
 // -- Mattermost wire types (the fields we consume) --
+
+export type MMFileInfo = {
+  id: string;
+  name?: string;
+  size?: number;
+  mime_type?: string;
+  post_id?: string;
+};
+
+export type AttachmentSummary = {
+  id: string;
+  name: string;
+  size?: number;
+  mime_type?: string;
+};
+
+// Summarize a post's attachments. Prefers the post's embedded
+// metadata.files (present on WS events and REST fetches); falls back to
+// bare ids when only file_ids is available. Names are sanitized here —
+// they end up inside envelope metadata read by a model.
+export function describeAttachments(post: {
+  file_ids?: string[];
+  metadata?: { files?: MMFileInfo[] };
+}): AttachmentSummary[] {
+  const infos = new Map<string, MMFileInfo>();
+  for (const f of post.metadata?.files ?? []) {
+    if (f && typeof f.id === "string") infos.set(f.id, f);
+  }
+  const ids = post.file_ids?.length ? post.file_ids : [...infos.keys()];
+  return ids.map((id) => {
+    const info = infos.get(id);
+    const out: AttachmentSummary = {
+      id,
+      name: sanitizeFilename(info?.name ?? id),
+    };
+    if (typeof info?.size === "number") out.size = info.size;
+    if (typeof info?.mime_type === "string") out.mime_type = info.mime_type;
+    return out;
+  });
+}
 
 export type MMUser = {
   id: string;
@@ -107,8 +153,7 @@ export function postToMessage(post: MMPost, mentions?: string[]): Message {
  * Flatten a Mattermost post list to Messages, oldest-first. Uses `order`
  * when present (it maps ids newest-first), falls back to the posts map, and
  * skips ids with no post body. No create_at cutoff is applied here — that is
- * catch-up policy (see mattermost-shared's selectCatchUpPosts), not
- * transport.
+ * catch-up policy (the bot core filters on createdAt), not transport.
  */
 export function flattenPostList(list: MMPostList): Message[] {
   const posts = list.posts ?? {};

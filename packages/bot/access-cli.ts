@@ -1,10 +1,14 @@
 #!/usr/bin/env bun
 /**
- * CLI tool for managing Mattermost channel access control.
- * Operates on ~/.claude/channels/mattermost/access.json
+ * CLI for managing bot access control. Operates on <state-dir>/access.json —
+ * the same file the running bot reads (ported from the legacy bridges'
+ * access-cli, now backend-neutral: ids can be Mattermost ids or Matrix
+ * MXIDs/room ids).
+ *
+ * State dir: BOT_STATE_DIR || MATTERMOST_ACCESS_HOME (legacy) || ~/.channel-bot
  *
  * Usage:
- *   bun access-cli.ts                      # show status
+ *   bun access-cli.ts                       # show status
  *   bun access-cli.ts pair <code>           # approve a pairing
  *   bun access-cli.ts deny <code>           # deny a pairing
  *   bun access-cli.ts allow <userId>        # add user to allowlist
@@ -14,84 +18,29 @@
  *   bun access-cli.ts group rm <channelId>  # remove channel from groups
  */
 
-import {
-  readFileSync,
-  writeFileSync,
-  renameSync,
-  mkdirSync,
-  existsSync,
-} from "fs";
-import { join } from "path";
+import { mkdirSync, writeFileSync } from "fs";
 import { homedir } from "os";
+import { join } from "path";
+import { pruneExpired, readAccess, saveAccess, type Access } from "./access.ts";
 
-// CLAUDE_CONFIG_DIR-aware: isolated profiles get isolated comms credentials.
-// MATTERMOST_ACCESS_HOME re-points only this CLI invocation (used by the
-// Codex bridge's wrapper); it is deliberately not read by either server so
-// one variable can never cross the Claude/Codex state directories.
-// Most-specific override wins.
-const CONFIG_ROOT = process.env.CLAUDE_CONFIG_DIR || join(homedir(), ".claude");
-const CHANNELS_DIR =
+const STATE_DIR =
+  process.env.BOT_STATE_DIR ||
   process.env.MATTERMOST_ACCESS_HOME ||
-  join(CONFIG_ROOT, "channels", "mattermost");
-const ACCESS_FILE = join(CHANNELS_DIR, "access.json");
-const APPROVED_DIR = join(CHANNELS_DIR, "approved");
+  join(homedir(), ".channel-bot");
+const ACCESS_FILE = join(STATE_DIR, "access.json");
+const APPROVED_DIR = join(STATE_DIR, "approved");
 
-type GroupPolicy = {
-  requireMention: boolean;
-  allowFrom: string[];
-};
+const read = (): Access => readAccess(ACCESS_FILE);
+const save = (access: Access): void => saveAccess(ACCESS_FILE, access);
 
-type PendingEntry = {
-  senderId: string;
-  chatId: string;
-  createdAt: number;
-  expiresAt: number;
-  replies: number;
-};
-
-type Access = {
-  dmPolicy: "pairing" | "allowlist" | "disabled";
-  allowFrom: string[];
-  groups: Record<string, GroupPolicy>;
-  pending: Record<string, PendingEntry>;
-};
-
-const DEFAULT_ACCESS: Access = {
-  dmPolicy: "pairing",
-  allowFrom: [],
-  groups: {},
-  pending: {},
-};
-
-function readAccess(): Access {
-  try {
-    const raw = readFileSync(ACCESS_FILE, "utf8");
-    return { ...DEFAULT_ACCESS, ...JSON.parse(raw) };
-  } catch {
-    return { ...DEFAULT_ACCESS };
-  }
-}
-
-function saveAccess(access: Access): void {
-  mkdirSync(CHANNELS_DIR, { recursive: true });
-  const tmp = ACCESS_FILE + ".tmp";
-  writeFileSync(tmp, JSON.stringify(access, null, 2) + "\n", { mode: 0o600 });
-  renameSync(tmp, ACCESS_FILE);
-}
-
-function pruneExpired(access: Access): void {
-  const now = Date.now();
-  for (const [code, entry] of Object.entries(access.pending)) {
-    if (entry.expiresAt < now) delete access.pending[code];
-  }
-}
-
-// Mattermost IDs are 26-char alphanumeric strings.
-const MM_ID_RE = /^[a-z0-9]{26}$/i;
+// Backend-neutral id check: Mattermost ids are 26-char alphanumerics, Matrix
+// user ids look like "@user:server" and room ids like "!room:server". Reject
+// whitespace and path-hostile characters; the bot re-validates on its side.
+const ID_RE = /^[A-Za-z0-9@:!._=-]+$/;
 
 function requireValidId(value: string | undefined, name: string): string {
-  if (!value || !MM_ID_RE.test(value)) {
-    console.error(`Invalid ${name}: expected 26-char alphanumeric Mattermost ID, got "${value ?? ""}"`);
+  if (!value || value.length > 255 || !ID_RE.test(value)) {
+    console.error(`Invalid ${name}: got "${value ?? ""}"`);
     process.exit(1);
   }
   return value;
@@ -102,11 +51,11 @@ const cmd = args[0];
 
 if (!cmd) {
   // Status
-  const access = readAccess();
+  const access = read();
   pruneExpired(access);
 
-  console.log("Mattermost Channel Access Status");
-  console.log("================================");
+  console.log(`Bot Access Status (${ACCESS_FILE})`);
+  console.log("=".repeat(32));
   console.log(`DM Policy: ${access.dmPolicy}`);
   console.log(`Allowed users (${access.allowFrom.length}):`);
   for (const id of access.allowFrom) console.log(`  - ${id}`);
@@ -125,9 +74,7 @@ if (!cmd) {
   for (const [channelId, policy] of groupEntries) {
     const mention = policy.requireMention ? "mention required" : "all messages";
     const allow =
-      policy.allowFrom.length > 0
-        ? `allowFrom: ${policy.allowFrom.join(", ")}`
-        : "all users";
+      policy.allowFrom.length > 0 ? `allowFrom: ${policy.allowFrom.join(", ")}` : "all users";
     console.log(`  - ${channelId}: ${mention}, ${allow}`);
   }
 } else if (cmd === "pair") {
@@ -137,7 +84,7 @@ if (!cmd) {
     process.exit(1);
   }
 
-  const access = readAccess();
+  const access = read();
   pruneExpired(access);
 
   const entry = access.pending[code];
@@ -145,28 +92,23 @@ if (!cmd) {
     console.error(`No pending pairing with code "${code}" (may have expired)`);
     process.exit(1);
   }
-
   if (entry.expiresAt < Date.now()) {
     delete access.pending[code];
-    saveAccess(access);
+    save(access);
     console.error("Pairing code has expired");
     process.exit(1);
   }
 
   const { senderId, chatId } = entry;
-
-  // Add to allowlist (dedupe)
-  if (!access.allowFrom.includes(senderId)) {
-    access.allowFrom.push(senderId);
-  }
+  if (!access.allowFrom.includes(senderId)) access.allowFrom.push(senderId);
   delete access.pending[code];
-  saveAccess(access);
+  save(access);
 
-  // Write approval marker for the server to pick up
+  // Approval marker: the running bot polls this dir and sends "Paired!".
   mkdirSync(APPROVED_DIR, { recursive: true, mode: 0o700 });
   writeFileSync(join(APPROVED_DIR, senderId), chatId, { mode: 0o600 });
 
-  console.log(`Approved sender ${senderId}. They'll receive a confirmation in Mattermost.`);
+  console.log(`Approved sender ${senderId}. They'll receive a confirmation message.`);
 } else if (cmd === "deny") {
   const code = args[1];
   if (!code) {
@@ -174,33 +116,31 @@ if (!cmd) {
     process.exit(1);
   }
 
-  const access = readAccess();
+  const access = read();
   if (access.pending[code]) {
     delete access.pending[code];
-    saveAccess(access);
+    save(access);
     console.log(`Denied and removed pairing code "${code}"`);
   } else {
     console.error(`No pending pairing with code "${code}"`);
   }
 } else if (cmd === "allow") {
   const userId = requireValidId(args[1], "userId");
-
-  const access = readAccess();
+  const access = read();
   if (!access.allowFrom.includes(userId)) {
     access.allowFrom.push(userId);
-    saveAccess(access);
+    save(access);
     console.log(`Added ${userId} to allowlist`);
   } else {
     console.log(`${userId} is already in allowlist`);
   }
 } else if (cmd === "remove") {
   const userId = requireValidId(args[1], "userId");
-
-  const access = readAccess();
+  const access = read();
   const before = access.allowFrom.length;
   access.allowFrom = access.allowFrom.filter((id) => id !== userId);
   if (access.allowFrom.length < before) {
-    saveAccess(access);
+    save(access);
     console.log(`Removed ${userId} from allowlist`);
   } else {
     console.log(`${userId} was not in allowlist`);
@@ -211,39 +151,32 @@ if (!cmd) {
     console.error("Usage: policy <pairing|allowlist|disabled>");
     process.exit(1);
   }
-
-  const access = readAccess();
+  const access = read();
   access.dmPolicy = mode as Access["dmPolicy"];
-  saveAccess(access);
+  save(access);
   console.log(`DM policy set to "${mode}"`);
 } else if (cmd === "group") {
   const subcmd = args[1];
-
   if (subcmd === "add") {
     const channelId = requireValidId(args[2], "channelId");
-
     const noMention = args.includes("--no-mention");
     const allowIdx = args.indexOf("--allow");
     const allowArg = allowIdx !== -1 ? args[allowIdx + 1] : undefined;
     const allowFrom = allowArg ? allowArg.split(",") : [];
     for (const id of allowFrom) requireValidId(id, "allowFrom userId");
 
-    const access = readAccess();
-    access.groups[channelId] = {
-      requireMention: !noMention,
-      allowFrom,
-    };
-    saveAccess(access);
+    const access = read();
+    access.groups[channelId] = { requireMention: !noMention, allowFrom };
+    save(access);
     console.log(
       `Added channel ${channelId} (mention: ${!noMention}, allowFrom: ${allowFrom.length > 0 ? allowFrom.join(", ") : "all"})`
     );
   } else if (subcmd === "rm") {
     const channelId = requireValidId(args[2], "channelId");
-
-    const access = readAccess();
+    const access = read();
     if (access.groups[channelId]) {
       delete access.groups[channelId];
-      saveAccess(access);
+      save(access);
       console.log(`Removed channel ${channelId} from groups`);
     } else {
       console.log(`Channel ${channelId} was not in groups`);
@@ -254,8 +187,6 @@ if (!cmd) {
   }
 } else {
   console.error(`Unknown command: ${cmd}`);
-  console.error(
-    "Commands: pair, deny, allow, remove, policy, group add, group rm"
-  );
+  console.error("Commands: pair, deny, allow, remove, policy, group add, group rm");
   process.exit(1);
 }

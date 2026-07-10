@@ -58,5 +58,5 @@ MessagingClient  ◄── defineMessagingClient(config => client)
 
 `fetchMessages({ since })` is defined as *created-or-updated after* —
 Mattermost's `?since=` filters on `update_at`. Catch-up consumers must apply
-their own create-time cutoff (see `mattermost-shared`'s
-`selectCatchUpPosts`) to avoid redelivering edited/re-touched posts.
+their own create-time cutoff (the `bot` core filters on `createdAt`) to
+avoid redelivering edited/re-touched posts.

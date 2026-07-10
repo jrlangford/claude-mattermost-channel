@@ -29,3 +29,5 @@ export {
   type MessagingClientFactory,
   type MessagingErrorCode,
 } from "./client.ts";
+
+export { sanitizeFilename } from "./sanitize.ts";

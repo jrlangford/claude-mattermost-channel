@@ -2,10 +2,46 @@ import { describe, expect, test } from "bun:test";
 import {
   channelFromMM,
   channelKindFromType,
+  describeAttachments,
   flattenPostList,
   postToMessage,
   userFromMM,
 } from "./convert.ts";
+
+// Ported from mattermost-shared's files.test.ts when describeAttachments
+// moved here.
+describe("describeAttachments", () => {
+  test("uses embedded metadata when present", () => {
+    expect(
+      describeAttachments({
+        file_ids: ["f1"],
+        metadata: { files: [{ id: "f1", name: "a.pdf", size: 9, mime_type: "application/pdf" }] },
+      })
+    ).toEqual([{ id: "f1", name: "a.pdf", size: 9, mime_type: "application/pdf" }]);
+  });
+
+  test("falls back to bare ids without metadata", () => {
+    expect(describeAttachments({ file_ids: ["f1"] })).toEqual([{ id: "f1", name: "f1" }]);
+  });
+
+  test("sanitizes hostile names from metadata", () => {
+    const [a] = describeAttachments({
+      file_ids: ["f1"],
+      metadata: { files: [{ id: "f1", name: "../../evil.sh" }] },
+    });
+    expect(a!.name).toBe("evil.sh");
+  });
+
+  test("derives ids from metadata when file_ids is absent", () => {
+    expect(describeAttachments({ metadata: { files: [{ id: "f2", name: "b.txt" }] } })).toEqual([
+      { id: "f2", name: "b.txt" },
+    ]);
+  });
+
+  test("empty post yields empty list", () => {
+    expect(describeAttachments({})).toEqual([]);
+  });
+});
 
 describe("channelKindFromType", () => {
   test("maps all four Mattermost types", () => {

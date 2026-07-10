@@ -1,5 +1,5 @@
-// Access control — ported from the bridge servers. The access.json shape is
-// unchanged (the access CLI in mattermost-shared keeps working); gate() is a
+// Access control — ported from the legacy bridge servers. The access.json
+// shape is unchanged (access-cli.ts in this package edits it); gate() is a
 // pure function over it so policy is unit-testable without a filesystem.
 
 import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "fs";

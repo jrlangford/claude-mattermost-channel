@@ -14,7 +14,6 @@
   },
   "dependencies": {
     "matrix-js-sdk": "^41.9.0",
-    "mattermost-shared": "workspace:*",
     "messaging-client": "workspace:*"
   },
   "devDependencies": {

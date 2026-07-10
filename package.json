@@ -12,8 +12,7 @@
   "scripts": {
     "check": "turbo run check",
     "test": "turbo run test",
-    "start:claude": "turbo run start --filter=claude-channel-mattermost",
-    "start:codex": "turbo run start --filter=codex-channel-mattermost"
+    "start:bot": "bun apps/bot/main.ts"
   },
   "devDependencies": {
     "turbo": "^2.5.0"

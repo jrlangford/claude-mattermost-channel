@@ -7,13 +7,15 @@
   "exports": {
     ".": "./index.ts"
   },
+  "bin": {
+    "bot-access": "./access-cli.ts"
+  },
   "scripts": {
     "test": "bun test",
     "check": "bun build ./index.ts --target=bun --outfile=/tmp/bot-check.js && rm -f /tmp/bot-check.js"
   },
   "dependencies": {
     "agent": "workspace:*",
-    "mattermost-shared": "workspace:*",
     "messaging-client": "workspace:*"
   },
   "devDependencies": {

@@ -8,6 +8,7 @@
     ".": "./index.ts"
   },
   "scripts": {
+    "test": "bun test",
     "check": "bun build ./index.ts --target=bun --outfile=/tmp/messaging-client-check.js && rm -f /tmp/messaging-client-check.js"
   },
   "devDependencies": {

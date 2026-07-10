@@ -1,29 +1,33 @@
 project_dir := justfile_directory()
-claude_app := project_dir / "apps/claude-mattermost-channel"
-codex_app := project_dir / "apps/codex-mattermost-bridge"
 
-# Recipes inherited from Amelia's mattermost-integration tooling at handover
-# (2026-07-04) — only the plugin-dev pieces; the MM server stack stays hers.
-# Reorganized into a bun + turborepo monorepo (apps/*, packages/*).
+# Originally inherited from Amelia's mattermost-integration tooling at
+# handover (2026-07-04); reshaped for the lego-bot monorepo (apps/bot +
+# packages/*). The MM server stack stays hers.
 
 default:
     @just --list
 
-# Launch a Claude Code session with the Claude channel app as the plugin (dev
+# Run the polymorphic bot with a config file.
+bot CONFIG:
+    cd {{project_dir}} && bun apps/bot/main.ts {{CONFIG}}
+
+# Launch a Claude Code session with apps/bot as the channel plugin (dev
 # loop: test changes without touching the marketplace cache the fleet runs).
+# Uses ~/.channel-bot/bot.config.json (see /channel:configure).
 claude-channel:
-    cd {{project_dir}} && claude --plugin-dir {{claude_app}} --dangerously-load-development-channels server:mattermost
+    cd {{project_dir}} && claude --plugin-dir {{project_dir}}/apps/bot --dangerously-load-development-channels server:channel
 
-# Manage Claude channel access control (access-cli against the live access.json).
+# Manage bot access control (pairing/allowlists; BOT_STATE_DIR-aware).
 access *ARGS:
-    cd {{claude_app}} && bun access-cli.ts {{ARGS}}
-
-# Manage Codex bridge access control (points at ~/.codex/mattermost).
-codex-access *ARGS:
-    cd {{codex_app}} && bun codex-access-cli.ts {{ARGS}}
+    cd {{project_dir}} && bun packages/bot/access-cli.ts {{ARGS}}
 
 # Type-check / smoke + unit tests across the whole workspace (via turbo).
 check:
     cd {{project_dir}} && bun run check
     cd {{project_dir}} && bun run test
     @echo "check OK"
+
+# Transport integration tests (docker compose; real Mattermost / Synapse).
+integration:
+    cd {{project_dir}}/packages/mattermost-client && bash integration/run.sh
+    cd {{project_dir}}/packages/matrix-client && bash integration/run.sh

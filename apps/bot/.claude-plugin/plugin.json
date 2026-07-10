@@ -1,0 +1,12 @@
+{
+  "name": "channel",
+  "description": "Messaging channel for Claude Code — polymorphic bot bridge (Mattermost/Matrix) with built-in access control. Manage pairing, allowlists, and policy via /channel:access; configure credentials via /channel:configure.",
+  "version": "0.1.0",
+  "keywords": [
+    "mattermost",
+    "matrix",
+    "messaging",
+    "channel",
+    "mcp"
+  ]
+}
