@@ -3,5 +3,5 @@
   "compilerOptions": {
     "types": ["bun-types", "node"]
   },
-  "include": ["*.ts"]
+  "include": ["*.ts", "e2e/*.ts"]
 }
