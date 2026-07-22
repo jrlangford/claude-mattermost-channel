@@ -15,6 +15,12 @@ claude-channel:
 access *ARGS:
     cd {{project_dir}} && bun access-cli.ts {{ARGS}}
 
+# Build the self-contained launch bundle. Committed as dist/server.js and run
+# directly by `start` — launch does NO `bun install` (see 0.0.11). Run before publishing.
+build:
+    cd {{project_dir}} && bun build server.ts --target=bun --outfile=dist/server.js
+    @echo "built dist/server.js"
+
 # Type-check / smoke + unit tests.
 check:
     bun build {{project_dir}}/server.ts --target=bun --outfile=/tmp/mm-channel-check.js && rm /tmp/mm-channel-check.js
