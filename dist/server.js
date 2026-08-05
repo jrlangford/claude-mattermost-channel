@@ -14110,6 +14110,27 @@ function describeAttachments(post) {
   });
 }
 
+// mm-http.ts
+async function mmJson(res, what) {
+  if (!res.ok) {
+    throw new Error(`${what} failed: ${await describeError(res)}`);
+  }
+  return await res.json();
+}
+async function mmOk(res, what) {
+  if (!res.ok) {
+    throw new Error(`${what} failed: ${await describeError(res)}`);
+  }
+}
+async function describeError(res) {
+  let detail = "";
+  try {
+    const err = await res.json();
+    detail = [err.id, err.message].filter(Boolean).join(" \u2014 ");
+  } catch {}
+  return `HTTP ${res.status}${detail ? ` (${detail})` : ""}`;
+}
+
 // server.ts
 process.on("unhandledRejection", (err) => {
   console.error("mattermost-channel: unhandled rejection:", err);
@@ -14390,7 +14411,7 @@ async function verifyOutboundChannel(bot, channelId) {
       }
     } else if (type === "G") {
       const res = await mmApi(bot, `/channels/${channelId}/members`);
-      const members = await res.json();
+      const members = await mmJson(res, "channel members fetch");
       if (Array.isArray(members)) {
         const others = members.filter((m) => !botUserIds.has(m.user_id));
         if (others.length > 0 && others.every((m) => access.allowFrom.includes(m.user_id)))
@@ -14418,7 +14439,7 @@ async function mmPost(bot, channelId, message, rootId, fileIds) {
     method: "POST",
     body: JSON.stringify(body)
   });
-  return res.json();
+  return mmJson(res, "post create");
 }
 async function mmGetFileInfo(bot, fileId) {
   const res = await mmApi(bot, `/files/${fileId}/info`);
@@ -14454,7 +14475,7 @@ async function mmEditPost(bot, postId, message) {
     method: "PUT",
     body: JSON.stringify({ message })
   });
-  return res.json();
+  return mmJson(res, "post edit");
 }
 async function mmReact(bot, postId, emoji2) {
   const res = await mmApi(bot, "/reactions", {
@@ -14465,7 +14486,7 @@ async function mmReact(bot, postId, emoji2) {
       emoji_name: emoji2
     })
   });
-  return res.json();
+  return mmJson(res, "react");
 }
 async function mmUnreact(bot, postId, emoji2) {
   await mmApi(bot, `/users/${bot.userId}/posts/${postId}/reactions/${emoji2}`, {
@@ -14474,21 +14495,22 @@ async function mmUnreact(bot, postId, emoji2) {
 }
 async function mmGetUser(bot, userId) {
   const res = await mmApi(bot, `/users/${userId}`);
-  return res.json();
+  return mmJson(res, "user fetch");
 }
 async function mmGetPost(bot, postId) {
   const res = await mmApi(bot, `/posts/${postId}`);
-  return res.json();
+  return mmJson(res, "post fetch");
 }
 async function mmGetChannel(bot, channelId) {
   const res = await mmApi(bot, `/channels/${channelId}`);
-  return res.json();
+  return mmJson(res, "channel fetch");
 }
 async function mmViewChannel(bot, channelId) {
-  await mmApi(bot, `/channels/members/${bot.userId}/view`, {
+  const res = await mmApi(bot, `/channels/members/${bot.userId}/view`, {
     method: "POST",
     body: JSON.stringify({ channel_id: channelId })
   });
+  await mmOk(res, "channel view");
 }
 async function mmViewChannelRetry(bot, channelId) {
   const attempts = 3;
@@ -14510,7 +14532,7 @@ async function mmViewChannelRetry(bot, channelId) {
 }
 async function mmGetChannelMember(bot, channelId) {
   const res = await mmApi(bot, `/channels/${channelId}/members/${bot.userId}`);
-  return res.json();
+  return mmJson(res, "channel member fetch");
 }
 function cappedSet(map2, key, value, cap) {
   map2.set(key, value);
@@ -14925,7 +14947,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
           markAsRead = true;
         }
         const res = await mmApi(botState.config, query);
-        const data = await res.json();
+        const data = await mmJson(res, "posts fetch");
         const posts = data.order?.map((id) => data.posts[id]).reverse().map((p) => ({
           id: p.id,
           user: p.user_id,
@@ -14945,11 +14967,11 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
       case "get_unreads": {
         const botState = resolveBot(args);
         const teamsRes = await mmApi(botState.config, `/users/me/teams`);
-        const teams = await teamsRes.json();
+        const teams = await mmJson(teamsRes, "teams fetch");
         const allChannelIds = [];
         for (const team of teams) {
           const chRes = await mmApi(botState.config, `/users/me/teams/${team.id}/channels`);
-          const channels = await chRes.json();
+          const channels = await mmJson(chRes, "team channels fetch");
           for (const ch of channels)
             allChannelIds.push(ch.id);
         }
@@ -14957,7 +14979,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
         for (const channelId of allChannelIds) {
           try {
             const res = await mmApi(botState.config, `/users/${botState.config.userId}/channels/${channelId}/unread`);
-            const data = await res.json();
+            const data = await mmJson(res, "unread fetch");
             if (data.msg_count > 0) {
               results.push({
                 channel_id: data.channel_id,
@@ -15085,11 +15107,11 @@ async function catchUpUnreads(state) {
   const { config: config2 } = state;
   const label = multiBot ? `[${config2.name}]` : "";
   const teamsRes = await mmApi(config2, `/users/me/teams`);
-  const teams = await teamsRes.json();
+  const teams = await mmJson(teamsRes, "teams fetch (catch-up)");
   const channelIds = [];
   for (const team of teams) {
     const chRes = await mmApi(config2, `/users/me/teams/${team.id}/channels`);
-    const channels = await chRes.json();
+    const channels = await mmJson(chRes, "team channels fetch (catch-up)");
     for (const ch of channels)
       channelIds.push(ch.id);
   }
@@ -15097,13 +15119,13 @@ async function catchUpUnreads(state) {
   for (const channelId of channelIds) {
     try {
       const unreadRes = await mmApi(config2, `/users/${config2.userId}/channels/${channelId}/unread`);
-      const unread = await unreadRes.json();
+      const unread = await mmJson(unreadRes, "unread fetch (catch-up)");
       if (unread.msg_count <= 0)
         continue;
       const member = await mmGetChannelMember(config2, channelId);
       const neverViewed = member.last_viewed_at <= 0;
       const postsRes = await mmApi(config2, neverViewed ? `/channels/${channelId}/posts?per_page=20` : `/channels/${channelId}/posts?since=${member.last_viewed_at}`);
-      const data = await postsRes.json();
+      const data = await mmJson(postsRes, "posts fetch (catch-up)");
       const posts = selectCatchUpPosts(data, neverViewed ? 0 : member.last_viewed_at);
       for (const post of posts) {
         await processPost(state, post);

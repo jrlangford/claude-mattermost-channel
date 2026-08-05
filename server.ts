@@ -30,6 +30,7 @@ import { join, basename } from "path";
 import { homedir } from "os";
 import { selectCatchUpPosts } from "./catchup.ts";
 import { describeAttachments, sanitizeFilename, type MMFileInfo } from "./files.ts";
+import { mmJson, mmOk } from "./mm-http.ts";
 
 // -- Crash handlers — log and keep serving instead of dying silently --
 process.on("unhandledRejection", (err) => {
@@ -458,7 +459,7 @@ async function verifyOutboundChannel(bot: BotConfig, channelId: string): Promise
       // Group DM — require ALL non-bot members to be allowlisted.
       // Otherwise a non-allowlisted member could see Claude's responses.
       const res = await mmApi(bot, `/channels/${channelId}/members`);
-      const members = (await res.json()) as { user_id: string }[];
+      const members = await mmJson<{ user_id: string }[]>(res, "channel members fetch");
       if (Array.isArray(members)) {
         const others = members.filter((m) => !botUserIds.has(m.user_id));
         if (others.length > 0 && others.every((m) => access.allowFrom.includes(m.user_id))) return;
@@ -496,7 +497,9 @@ async function mmPost(
     method: "POST",
     body: JSON.stringify(body),
   });
-  return res.json() as Promise<MMPost>;
+  // mmJson, not res.json(): a rejected post's error body parses as a "post"
+  // whose id is the MM error string — the 4hn89 false-success.
+  return mmJson<MMPost>(res, "post create");
 }
 
 async function mmGetFileInfo(bot: BotConfig, fileId: string): Promise<MMFileInfo> {
@@ -539,7 +542,7 @@ async function mmEditPost(bot: BotConfig, postId: string, message: string): Prom
     method: "PUT",
     body: JSON.stringify({ message }),
   });
-  return res.json() as Promise<MMPost>;
+  return mmJson<MMPost>(res, "post edit");
 }
 
 async function mmReact(bot: BotConfig, postId: string, emoji: string) {
@@ -551,7 +554,9 @@ async function mmReact(bot: BotConfig, postId: string, emoji: string) {
       emoji_name: emoji,
     }),
   });
-  return res.json();
+  // Checked: a react against a bad post/channel previously "succeeded" with
+  // the error body as its return value (the corrupted-chat_id incident).
+  return mmJson<unknown>(res, "react");
 }
 
 async function mmUnreact(bot: BotConfig, postId: string, emoji: string) {
@@ -569,24 +574,29 @@ async function mmSendTyping(bot: BotConfig, channelId: string) {
 
 async function mmGetUser(bot: BotConfig, userId: string): Promise<MMUser> {
   const res = await mmApi(bot, `/users/${userId}`);
-  return res.json() as Promise<MMUser>;
+  return mmJson<MMUser>(res, "user fetch");
 }
 
 async function mmGetPost(bot: BotConfig, postId: string): Promise<MMPost> {
   const res = await mmApi(bot, `/posts/${postId}`);
-  return res.json() as Promise<MMPost>;
+  return mmJson<MMPost>(res, "post fetch");
 }
 
 async function mmGetChannel(bot: BotConfig, channelId: string): Promise<MMChannel> {
   const res = await mmApi(bot, `/channels/${channelId}`);
-  return res.json() as Promise<MMChannel>;
+  return mmJson<MMChannel>(res, "channel fetch");
 }
 
 async function mmViewChannel(bot: BotConfig, channelId: string): Promise<void> {
-  await mmApi(bot, `/channels/members/${bot.userId}/view`, {
+  const res = await mmApi(bot, `/channels/members/${bot.userId}/view`, {
     method: "POST",
     body: JSON.stringify({ channel_id: channelId }),
   });
+  // Checked (4hn89 class): without this, an HTTP-level view failure never
+  // reached mmViewChannelRetry's catch — the retry/backoff/log machinery
+  // below only ever saw network errors, and stale read pointers from
+  // rejected views were exactly the silent redelivery source it documents.
+  await mmOk(res, "channel view");
 }
 
 // A failed view leaves the read pointer stale: the next catch-up re-fetches
@@ -620,7 +630,7 @@ async function mmViewChannelRetry(bot: BotConfig, channelId: string): Promise<vo
 
 async function mmGetChannelMember(bot: BotConfig, channelId: string): Promise<{ last_viewed_at: number; msg_count: number }> {
   const res = await mmApi(bot, `/channels/${channelId}/members/${bot.userId}`);
-  return res.json() as Promise<{ last_viewed_at: number; msg_count: number }>;
+  return mmJson<{ last_viewed_at: number; msg_count: number }>(res, "channel member fetch");
 }
 
 // Simple capped map — evicts oldest entry when cap is reached
@@ -1117,7 +1127,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
       }
 
       const res = await mmApi(botState.config, query);
-      const data = (await res.json()) as MMPostList;
+      const data = await mmJson<MMPostList>(res, "posts fetch");
       const posts = data.order
         ?.map((id: string) => data.posts[id]!)
         .reverse()
@@ -1144,11 +1154,11 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
       const botState = resolveBot(args);
       // Get all teams, then all channels per team — covers DMs, groups, and public/private channels
       const teamsRes = await mmApi(botState.config, `/users/me/teams`);
-      const teams = (await teamsRes.json()) as { id: string }[];
+      const teams = await mmJson<{ id: string }[]>(teamsRes, "teams fetch");
       const allChannelIds: string[] = [];
       for (const team of teams) {
         const chRes = await mmApi(botState.config, `/users/me/teams/${team.id}/channels`);
-        const channels = (await chRes.json()) as { id: string }[];
+        const channels = await mmJson<{ id: string }[]>(chRes, "team channels fetch");
         for (const ch of channels) allChannelIds.push(ch.id);
       }
       const results: { channel_id: string; msg_count: number; mention_count: number }[] = [];
@@ -1158,11 +1168,11 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
             botState.config,
             `/users/${botState.config.userId}/channels/${channelId}/unread`
           );
-          const data = (await res.json()) as {
+          const data = await mmJson<{
             channel_id: string;
             msg_count: number;
             mention_count: number;
-          };
+          }>(res, "unread fetch");
           if (data.msg_count > 0) {
             results.push({
               channel_id: data.channel_id,
@@ -1337,12 +1347,12 @@ async function catchUpUnreads(state: BotState) {
   const label = multiBot ? `[${config.name}]` : "";
 
   const teamsRes = await mmApi(config, `/users/me/teams`);
-  const teams = (await teamsRes.json()) as { id: string }[];
+  const teams = await mmJson<{ id: string }[]>(teamsRes, "teams fetch (catch-up)");
 
   const channelIds: string[] = [];
   for (const team of teams) {
     const chRes = await mmApi(config, `/users/me/teams/${team.id}/channels`);
-    const channels = (await chRes.json()) as { id: string }[];
+    const channels = await mmJson<{ id: string }[]>(chRes, "team channels fetch (catch-up)");
     for (const ch of channels) channelIds.push(ch.id);
   }
 
@@ -1353,7 +1363,7 @@ async function catchUpUnreads(state: BotState) {
         config,
         `/users/${config.userId}/channels/${channelId}/unread`
       );
-      const unread = (await unreadRes.json()) as { msg_count: number };
+      const unread = await mmJson<{ msg_count: number }>(unreadRes, "unread fetch (catch-up)");
       if (unread.msg_count <= 0) continue;
 
       // Fetch posts since last_viewed_at. Never-viewed channels (a brand-new
@@ -1369,7 +1379,7 @@ async function catchUpUnreads(state: BotState) {
           ? `/channels/${channelId}/posts?per_page=20`
           : `/channels/${channelId}/posts?since=${member.last_viewed_at}`
       );
-      const data = (await postsRes.json()) as MMPostList;
+      const data = await mmJson<MMPostList>(postsRes, "posts fetch (catch-up)");
       // Cutoff on create_at: the since-fetch matches on update_at, so it also
       // returns old posts our own 👀 add/remove re-touched (see catchup.ts).
       const posts = selectCatchUpPosts(data, neverViewed ? 0 : member.last_viewed_at);
