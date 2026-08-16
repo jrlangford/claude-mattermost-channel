@@ -24,9 +24,15 @@ import {
 import { join } from "path";
 import { homedir } from "os";
 
-// CLAUDE_CONFIG_DIR-aware: isolated profiles get isolated comms credentials
+// CLAUDE_CONFIG_DIR-aware: isolated profiles get isolated comms credentials.
+// MATTERMOST_ACCESS_HOME re-points only this CLI invocation (used by the
+// Codex bridge's wrapper); it is deliberately not read by either server so
+// one variable can never cross the Claude/Codex state directories.
+// Most-specific override wins.
 const CONFIG_ROOT = process.env.CLAUDE_CONFIG_DIR || join(homedir(), ".claude");
-const CHANNELS_DIR = join(CONFIG_ROOT, "channels", "mattermost");
+const CHANNELS_DIR =
+  process.env.MATTERMOST_ACCESS_HOME ||
+  join(CONFIG_ROOT, "channels", "mattermost");
 const ACCESS_FILE = join(CHANNELS_DIR, "access.json");
 const APPROVED_DIR = join(CHANNELS_DIR, "approved");
 

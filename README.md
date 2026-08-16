@@ -106,6 +106,22 @@ Both directions enforce a size cap (`MM_MAX_FILE_MB`, default 50). Downloads
 are gated by the same channel allowlist as every other tool, and attachment
 contents are flagged to the model as untrusted sender input.
 
+## Codex SDK Bridge
+
+This repo also includes an experimental Codex version that runs as a standalone
+Mattermost bot bridge. It lives in [`codex-bridge/`](codex-bridge/) as a
+self-contained package, so its `@openai/codex-sdk` dependency is never
+installed by the Claude plugin:
+
+```bash
+cd codex-bridge
+bun install
+bun codex-server.ts
+```
+
+See [`codex-bridge/README.md`](codex-bridge/README.md) for setup, pairing, and
+configuration.
+
 ## Environment Variables
 
 The plugin reads from `~/.claude/channels/mattermost/.env` or from the MCP server environment:
