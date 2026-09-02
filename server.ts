@@ -68,7 +68,10 @@ type BotState = {
 // CLAUDE_CONFIG_DIR-aware: isolated profiles get isolated comms credentials
 const CONFIG_ROOT = process.env.CLAUDE_CONFIG_DIR || join(homedir(), ".claude");
 const CHANNELS_DIR = join(CONFIG_ROOT, "channels", "mattermost");
-const BOTS_FILE = join(CHANNELS_DIR, "bots.json");
+// MM_BOTS_FILE: an explicit bots.json path (the agent-runtime hands the codex
+// MCP server the exact file it read, so no token has to travel on the process
+// command line — beads-y93jo). Default: CONFIG_ROOT's bots.json.
+const BOTS_FILE = process.env.MM_BOTS_FILE || join(CHANNELS_DIR, "bots.json");
 const CHANNELS_ENV = join(CHANNELS_DIR, ".env");
 const ACCESS_FILE = join(CHANNELS_DIR, "access.json");
 const APPROVED_DIR = join(CHANNELS_DIR, "approved");

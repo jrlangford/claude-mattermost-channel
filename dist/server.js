@@ -14181,7 +14181,7 @@ process.on("uncaughtException", (err) => {
 });
 var CONFIG_ROOT = process.env.CLAUDE_CONFIG_DIR || join(homedir(), ".claude");
 var CHANNELS_DIR = join(CONFIG_ROOT, "channels", "mattermost");
-var BOTS_FILE = join(CHANNELS_DIR, "bots.json");
+var BOTS_FILE = process.env.MM_BOTS_FILE || join(CHANNELS_DIR, "bots.json");
 var CHANNELS_ENV = join(CHANNELS_DIR, ".env");
 var ACCESS_FILE = join(CHANNELS_DIR, "access.json");
 var APPROVED_DIR = join(CHANNELS_DIR, "approved");

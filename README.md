@@ -117,6 +117,7 @@ The plugin reads from `~/.claude/channels/mattermost/.env` or from the MCP serve
 | `MM_BOT_USER_ID` | Yes | Bot user ID |
 | `MM_HEARTBEAT_INTERVAL` | No | WebSocket heartbeat interval in seconds (default: `0` = disabled) |
 | `MM_MAX_FILE_MB` | No | Attachment size cap in MB for download/upload (default: `50`) |
+| `MM_BOTS_FILE` | No | Explicit path to the bots.json to load (default: `<config root>/channels/mattermost/bots.json`). Lets a host pass a file path instead of a token |
 | `MM_CATCHUP_MAX_PER_CHANNEL` | No | Boot catch-up: newest N unread posts delivered per channel (default: `25`) |
 | `MM_CATCHUP_MAX_TOTAL` | No | Boot catch-up: max posts delivered per (re)connect across all channels (default: `100`) |
 
