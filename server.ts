@@ -28,7 +28,7 @@ import {
 import { statSync } from "fs";
 import { join, basename } from "path";
 import { homedir } from "os";
-import { selectCatchUpPosts } from "./catchup.ts";
+import { CatchUpBudget, catchUpCapsFromEnv, orderCatchUpChannels, selectCatchUpPosts } from "./catchup.ts";
 import { describeAttachments, sanitizeFilename, type MMFileInfo } from "./files.ts";
 import { mmJson, mmOk } from "./mm-http.ts";
 
@@ -1256,7 +1256,8 @@ const HEARTBEAT_INTERVAL = parseInt(process.env.MM_HEARTBEAT_INTERVAL ?? "0") * 
 
 // Process one inbound post — shared by live WS events and reconnect catch-up.
 // Validates, dedupes, gates, and forwards to Claude via MCP notification.
-async function processPost(state: BotState, post: MMPost) {
+// `extraMeta` rides on the envelope as attributes (catch-up truncation marks).
+async function processPost(state: BotState, post: MMPost, extraMeta?: Record<string, string>) {
   const { config } = state;
 
   // Validate all IDs at the ingress boundary.
@@ -1302,6 +1303,7 @@ async function processPost(state: BotState, post: MMPost) {
 
   if (multiBot) meta.bot = config.name;
   if (post.root_id) meta.thread_id = post.root_id;
+  if (extraMeta) Object.assign(meta, extraMeta);
   if (post.file_ids?.length) {
     meta.attachment_count = String(post.file_ids.length);
     // Per-file id/name/size/mime so the session can download_attachment
@@ -1342,6 +1344,15 @@ async function processPost(state: BotState, post: MMPost) {
 
 // Fetch messages that arrived while the bot was disconnected and push them
 // through the live delivery pipeline. Runs after WS (re)connect.
+//
+// CAPPED (beads-vrp11): conversations (D/G/P) are served before public channels,
+// each channel delivers at most its newest MM_CATCHUP_MAX_PER_CHANNEL posts, and
+// at most MM_CATCHUP_MAX_TOTAL posts are delivered per connect (a D/G/P channel
+// still surfaces its newest post once the budget is gone). The first delivered
+// envelope of a truncated channel carries catchup_skipped="K" catchup_cap="N";
+// a channel with nothing delivered is flushed (viewed) so the backlog does not
+// return on the next connect. Uncapped, a three-week sleep in a busy channel
+// fed 2,949 posts into one turn and the session was rejected as too long.
 async function catchUpUnreads(state: BotState) {
   const { config } = state;
   const label = multiBot ? `[${config.name}]` : "";
@@ -1349,15 +1360,19 @@ async function catchUpUnreads(state: BotState) {
   const teamsRes = await mmApi(config, `/users/me/teams`);
   const teams = await mmJson<{ id: string }[]>(teamsRes, "teams fetch (catch-up)");
 
-  const channelIds: string[] = [];
+  const channels: { id: string; type?: string; display_name?: string; name?: string }[] = [];
   for (const team of teams) {
     const chRes = await mmApi(config, `/users/me/teams/${team.id}/channels`);
-    const channels = await mmJson<{ id: string }[]>(chRes, "team channels fetch (catch-up)");
-    for (const ch of channels) channelIds.push(ch.id);
+    const list = await mmJson<{ id: string; type?: string; display_name?: string; name?: string }[]>(chRes, "team channels fetch (catch-up)");
+    for (const ch of list) channels.push({ id: ch.id, type: ch.type, display_name: ch.display_name, name: ch.name });
   }
 
+  const caps = catchUpCapsFromEnv();
+  const budget = new CatchUpBudget(caps);
   let totalDelivered = 0;
-  for (const channelId of channelIds) {
+  let totalSkipped = 0;
+  for (const ch of orderCatchUpChannels(channels)) {
+    const channelId = ch.id;
     try {
       const unreadRes = await mmApi(
         config,
@@ -1383,18 +1398,34 @@ async function catchUpUnreads(state: BotState) {
       // Cutoff on create_at: the since-fetch matches on update_at, so it also
       // returns old posts our own 👀 add/remove re-touched (see catchup.ts).
       const posts = selectCatchUpPosts(data, neverViewed ? 0 : member.last_viewed_at);
+      const { deliver, skipped } = budget.plan(ch.type, posts);
+      if (skipped > 0) {
+        totalSkipped += skipped;
+        console.error(
+          `mattermost-channel:${label} catch-up cap on channel ${channelId} (${ch.type ?? "?"} ${ch.display_name ?? ch.name ?? ""}): ` +
+            `${posts.length} unread, delivering newest ${deliver.length}, skipping ${skipped} (per-channel ${caps.maxPerChannel}, total ${caps.maxTotal}) — beads-vrp11`,
+        );
+      }
 
-      for (const post of posts) {
-        await processPost(state, post);
+      for (let i = 0; i < deliver.length; i++) {
+        const extra = i === 0 && skipped > 0
+          ? { catchup_skipped: String(skipped), catchup_cap: String(caps.maxPerChannel) }
+          : undefined;
+        await processPost(state, deliver[i]!, extra);
         totalDelivered++;
+      }
+      if (deliver.length === 0 && skipped > 0) {
+        // Nothing delivered from this channel, so no per-post view timer will
+        // run: flush it explicitly or the same backlog returns next connect.
+        mmViewChannelRetry(config, channelId);
       }
     } catch (err) {
       console.error(`mattermost-channel:${label} catch-up error on channel ${channelId}:`, err);
     }
   }
 
-  if (totalDelivered > 0) {
-    console.error(`mattermost-channel:${label} catch-up delivered ${totalDelivered} post(s)`);
+  if (totalDelivered > 0 || totalSkipped > 0) {
+    console.error(`mattermost-channel:${label} catch-up delivered ${totalDelivered} post(s), skipped ${totalSkipped} (capped)`);
   }
 }
 

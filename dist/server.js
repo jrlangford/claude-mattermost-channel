@@ -14083,6 +14083,46 @@ import { homedir } from "os";
 function selectCatchUpPosts(data, lastViewedAt) {
   return (data.order ?? []).map((id) => data.posts[id]).filter((p) => !!p && !!p.create_at && p.create_at > lastViewedAt).sort((a, b) => a.create_at - b.create_at);
 }
+var CATCHUP_DEFAULTS = { maxPerChannel: 25, maxTotal: 100 };
+function positiveInt(raw, fallback) {
+  const n = parseInt(raw ?? "", 10);
+  return Number.isFinite(n) && n >= 1 ? n : fallback;
+}
+function catchUpCapsFromEnv(env = process.env) {
+  return {
+    maxPerChannel: positiveInt(env.MM_CATCHUP_MAX_PER_CHANNEL, CATCHUP_DEFAULTS.maxPerChannel),
+    maxTotal: positiveInt(env.MM_CATCHUP_MAX_TOTAL, CATCHUP_DEFAULTS.maxTotal)
+  };
+}
+var CHANNEL_RANK = { D: 0, G: 1, P: 2, O: 3 };
+function orderCatchUpChannels(channels) {
+  return [...channels].sort((a, b) => (CHANNEL_RANK[a.type ?? ""] ?? 4) - (CHANNEL_RANK[b.type ?? ""] ?? 4));
+}
+function isConversationChannel(type) {
+  return type === "D" || type === "G" || type === "P";
+}
+
+class CatchUpBudget {
+  caps;
+  used = 0;
+  constructor(caps) {
+    this.caps = caps;
+  }
+  plan(channelType, posts) {
+    const n = posts.length;
+    if (n === 0)
+      return { deliver: [], skipped: 0 };
+    const remaining = Math.max(0, this.caps.maxTotal - this.used);
+    let allow = Math.min(n, this.caps.maxPerChannel, remaining);
+    if (allow === 0 && isConversationChannel(channelType))
+      allow = 1;
+    this.used += allow;
+    return { deliver: posts.slice(n - allow), skipped: n - allow };
+  }
+  get delivered() {
+    return this.used;
+  }
+}
 
 // files.ts
 function sanitizeFilename(name) {
@@ -15038,7 +15078,7 @@ setInterval(checkApprovals, 5000).unref();
 var shuttingDown = false;
 var MAX_RECONNECT_DELAY = 5 * 60 * 1000;
 var HEARTBEAT_INTERVAL = parseInt(process.env.MM_HEARTBEAT_INTERVAL ?? "0") * 1000;
-async function processPost(state, post) {
+async function processPost(state, post, extraMeta) {
   const { config: config2 } = state;
   if (!post.user_id || !post.channel_id || !post.id)
     return;
@@ -15083,6 +15123,8 @@ Run this in your Claude Code terminal:
     meta2.bot = config2.name;
   if (post.root_id)
     meta2.thread_id = post.root_id;
+  if (extraMeta)
+    Object.assign(meta2, extraMeta);
   if (post.file_ids?.length) {
     meta2.attachment_count = String(post.file_ids.length);
     meta2.attachments = JSON.stringify(describeAttachments(post));
@@ -15108,15 +15150,19 @@ async function catchUpUnreads(state) {
   const label = multiBot ? `[${config2.name}]` : "";
   const teamsRes = await mmApi(config2, `/users/me/teams`);
   const teams = await mmJson(teamsRes, "teams fetch (catch-up)");
-  const channelIds = [];
+  const channels = [];
   for (const team of teams) {
     const chRes = await mmApi(config2, `/users/me/teams/${team.id}/channels`);
-    const channels = await mmJson(chRes, "team channels fetch (catch-up)");
-    for (const ch of channels)
-      channelIds.push(ch.id);
+    const list = await mmJson(chRes, "team channels fetch (catch-up)");
+    for (const ch of list)
+      channels.push({ id: ch.id, type: ch.type, display_name: ch.display_name, name: ch.name });
   }
+  const caps = catchUpCapsFromEnv();
+  const budget = new CatchUpBudget(caps);
   let totalDelivered = 0;
-  for (const channelId of channelIds) {
+  let totalSkipped = 0;
+  for (const ch of orderCatchUpChannels(channels)) {
+    const channelId = ch.id;
     try {
       const unreadRes = await mmApi(config2, `/users/${config2.userId}/channels/${channelId}/unread`);
       const unread = await mmJson(unreadRes, "unread fetch (catch-up)");
@@ -15127,16 +15173,25 @@ async function catchUpUnreads(state) {
       const postsRes = await mmApi(config2, neverViewed ? `/channels/${channelId}/posts?per_page=20` : `/channels/${channelId}/posts?since=${member.last_viewed_at}`);
       const data = await mmJson(postsRes, "posts fetch (catch-up)");
       const posts = selectCatchUpPosts(data, neverViewed ? 0 : member.last_viewed_at);
-      for (const post of posts) {
-        await processPost(state, post);
+      const { deliver, skipped } = budget.plan(ch.type, posts);
+      if (skipped > 0) {
+        totalSkipped += skipped;
+        console.error(`mattermost-channel:${label} catch-up cap on channel ${channelId} (${ch.type ?? "?"} ${ch.display_name ?? ch.name ?? ""}): ` + `${posts.length} unread, delivering newest ${deliver.length}, skipping ${skipped} (per-channel ${caps.maxPerChannel}, total ${caps.maxTotal}) \u2014 beads-vrp11`);
+      }
+      for (let i = 0;i < deliver.length; i++) {
+        const extra = i === 0 && skipped > 0 ? { catchup_skipped: String(skipped), catchup_cap: String(caps.maxPerChannel) } : undefined;
+        await processPost(state, deliver[i], extra);
         totalDelivered++;
+      }
+      if (deliver.length === 0 && skipped > 0) {
+        mmViewChannelRetry(config2, channelId);
       }
     } catch (err) {
       console.error(`mattermost-channel:${label} catch-up error on channel ${channelId}:`, err);
     }
   }
-  if (totalDelivered > 0) {
-    console.error(`mattermost-channel:${label} catch-up delivered ${totalDelivered} post(s)`);
+  if (totalDelivered > 0 || totalSkipped > 0) {
+    console.error(`mattermost-channel:${label} catch-up delivered ${totalDelivered} post(s), skipped ${totalSkipped} (capped)`);
   }
 }
 function connectBot(state) {
