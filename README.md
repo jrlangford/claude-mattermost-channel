@@ -117,10 +117,16 @@ The plugin reads from `~/.claude/channels/mattermost/.env` or from the MCP serve
 | `MM_BOT_USER_ID` | Yes | Bot user ID |
 | `MM_HEARTBEAT_INTERVAL` | No | WebSocket heartbeat interval in seconds (default: `0` = disabled) |
 | `MM_MAX_FILE_MB` | No | Attachment size cap in MB for download/upload (default: `50`) |
+| `MM_CATCHUP_MAX_PER_CHANNEL` | No | Boot catch-up: newest N unread posts delivered per channel (default: `25`) |
+| `MM_CATCHUP_MAX_TOTAL` | No | Boot catch-up: max posts delivered per (re)connect across all channels (default: `100`) |
 
 ### Heartbeat (remote agents)
 
 When a host sleeps, Docker suspends the container and the Mattermost WebSocket enters a half-open state: the server closes its side, but the client never receives the FIN. On wake, the existing reconnect logic doesn't fire because no `close` event is delivered — and messages sent during the gap are silently dropped.
+
+### Catch-up caps
+
+On (re)connect the plugin delivers the posts that arrived while it was down. That delivery is capped: channels are served DMs → group DMs → private → public; each channel delivers at most its newest `MM_CATCHUP_MAX_PER_CHANNEL` posts and at most `MM_CATCHUP_MAX_TOTAL` posts are delivered per connect (a DM/private channel still surfaces its newest post once the budget is spent; public channels get nothing and are marked read). Truncation is never silent: the first delivered envelope of a truncated channel carries `catchup_skipped="K"` and `catchup_cap="N"`, and stderr names every cap hit. Uncapped, an agent asleep for weeks in a busy channel woke into thousands of posts in one turn and the session was rejected as too long.
 
 Set `MM_HEARTBEAT_INTERVAL=30` to enable a protocol-level WebSocket ping every 30 seconds. If no pong is received within 60 seconds (2× the interval), the plugin force-closes the socket and the existing exponential-backoff reconnect runs.
 
